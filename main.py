@@ -144,6 +144,14 @@ def turbo_colormap(t: np.ndarray) -> np.ndarray:
     rgb = np.clip(np.stack([r, g, b], axis=1), 0.0, 1.0)
     return (rgb * 255).astype(np.uint8)
 
+# ---- small helper to build vtkMatrix from numpy ----
+def np_to_vtk_matrix(T: np.ndarray) -> vtk.vtkMatrix4x4:
+    m = vtk.vtkMatrix4x4()
+    for r in range(4):
+        for c in range(4):
+            m.SetElement(r, c, float(T[r, c]))
+    return m
+
 # --------- Backend-agnostic ICP (GPU via Cupoch, else Open3D CPU) ---------
 def icp_transform_backend(src_pts_np: np.ndarray, tgt_pts_np: np.ndarray, voxel: float, init=np.eye(4)):
     """Return (T, fitness); uses Cupoch on GPU when available."""
@@ -474,6 +482,27 @@ def build_app(seq_dir: str, fps: int = 10):
     scan_prop = scan_actor.GetProperty(); scan_prop.SetRenderPointsAsSpheres(1)
     ren_left.AddActor(scan_actor)
 
+    # ---- Pose marker (current vehicle pose) on map view ----
+    marker_src = vtk.vtkConeSource()
+    marker_src.SetRadius(0.6)          # ~0.6 m
+    marker_src.SetHeight(1.8)          # ~1.8 m arrow length
+    marker_src.SetDirection(1, 0, 0)   # model x-axis points forward
+    marker_src.SetResolution(32)
+
+    marker_mapper = vtk.vtkPolyDataMapper()
+    marker_mapper.SetInputConnection(marker_src.GetOutputPort())
+
+    marker_actor = vtk.vtkActor()
+    marker_actor.SetMapper(marker_mapper)
+    marker_actor.GetProperty().SetColor(1.0, 0.2, 0.2)  # red-ish
+    marker_actor.GetProperty().SetAmbient(0.25)
+    marker_actor.GetProperty().SetDiffuse(0.9)
+    marker_actor.GetProperty().SetSpecular(0.1)
+    marker_actor.GetProperty().SetSpecularPower(10)
+    marker_actor.SetPickable(False)
+    marker_actor.SetVisibility(False)  # hidden by default
+    ren_right.AddActor(marker_actor)
+
     ren_left.ResetCamera(); ren_right.ResetCamera()
 
     # --- State ---
@@ -506,6 +535,10 @@ def build_app(seq_dir: str, fps: int = 10):
     state.cam_up   = 15.0
     state.cam_side = 0.0
 
+    # pose marker controls (shown when not following)
+    state.show_pose_marker = True
+    state.marker_size = 1.0
+
     # playback
     state.play = False; state.fps = int(fps)
 
@@ -525,7 +558,7 @@ def build_app(seq_dir: str, fps: int = 10):
     state.map_building = False; state.map_progress = 0.0
 
     # prefetch
-    PREFETCH = 24
+    PREFETCH = 16
     pool = ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 2))
     def prefetch(idx):
         end = min(idx + 1 + PREFETCH, state.n_frames)
@@ -675,6 +708,40 @@ def build_app(seq_dir: str, fps: int = 10):
         cam.SetViewUp(float(up[0]), float(up[1]), float(up[2]))
         ren_right.ResetCameraClippingRange()
 
+    # ---- Pose marker (show when follow_pose is OFF) ----
+    def update_pose_marker():
+        nonlocal slam
+        try:
+            if not bool(state.show_pose_marker) or bool(state.follow_pose):
+                marker_actor.SetVisibility(False)
+                return
+        except Exception:
+            marker_actor.SetVisibility(False)
+            return
+
+        if slam is None:
+            marker_actor.SetVisibility(False)
+            return
+
+        idx = int(state.frame)
+        with slam.lock:
+            if idx >= len(slam.poses):
+                marker_actor.SetVisibility(False)
+                return
+            T = slam.poses[idx].copy()
+
+        # Build orientation basis: columns = [fwd, left, up]
+        p, fwd, left, up = extract_pose_vectors(T)
+        R = np.column_stack((fwd, left, up))          # 3x3
+        Tw = np.eye(4, dtype=np.float32)
+        Tw[:3, :3] = R
+        Tw[:3,  3] = p
+
+        marker_actor.SetUserMatrix(np_to_vtk_matrix(Tw))
+        s = max(0.2, float(as_float(state.marker_size, 1.0)))
+        marker_actor.SetScale(s, s, s)
+        marker_actor.SetVisibility(True)
+
     # ---- View layout (split / map-only during build) ----
     def update_view_layout():
         map_only = bool(state.map_only_on_build) and bool(state.map_building)
@@ -751,6 +818,7 @@ def build_app(seq_dir: str, fps: int = 10):
         update_map_actor()
         update_camera_follow_right()
         update_view_layout()
+        update_pose_marker()
 
         # When user just enabled fast mapper, self-test it and auto-revert on failure
         if state.use_fast_mapper and not last_fast["v"]:
@@ -806,6 +874,7 @@ def build_app(seq_dir: str, fps: int = 10):
             update_map_actor()
             update_camera_follow_right()
             update_view_layout()
+            update_pose_marker()
             if last_map_version["v"] >= 0: push_view()
 
     # playback
@@ -890,6 +959,7 @@ def build_app(seq_dir: str, fps: int = 10):
         map_mapper_std.SetInputData(empty); map_mapper_fast.SetInputData(empty)
         scan_mapper_std.SetInputData(empty); scan_mapper_fast.SetInputData(empty)
         map_actor.SetMapper(map_mapper_std); scan_actor.SetMapper(scan_mapper_std)
+        marker_actor.SetVisibility(False)
         state.map_progress = 0.0; state.map_building = False
         update_view_layout()
         ctrl.view_update()
@@ -948,15 +1018,19 @@ def build_app(seq_dir: str, fps: int = 10):
                     h.Hr()
                     with h.Div(style="display:flex; gap:10px; align-items:center;"):
                         h.Input(type="checkbox", v_model=("follow_pose", True), change=ctrl.update_frame); h.Label("Follow current pose (map/right)")
+                    with h.Div(style="display:flex; gap:10px; align-items:center;"):
+                        h.Input(type="checkbox", v_model=("show_pose_marker", True), change=ctrl.update_frame); h.Label("Show pose marker when not following")
+                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                        h.Label("Marker size"); h.Input(type="range", min=0.3, max=3.0, step=0.1, v_model=("marker_size", 1.0), change=ctrl.update_frame, style="flex:1")
                     with h.Div(style="display:flex; gap:8px; align-items:center;"):
                         h.Label("Back"); h.Input(type="number", step="1", v_model=("cam_back", 30.0), change=ctrl.update_frame, style="width:30%")
                         h.Label("Up");   h.Input(type="number", step="1", v_model=("cam_up", 15.0), change=ctrl.update_frame, style="width:30%")
                         h.Label("Side (+L/-R)"); h.Input(type="number", step="1", v_model=("cam_side", 0.0), change=ctrl.update_frame, style="width:30%")
 
                     h.Hr()
-                    with h.Div(style="display:flex; gap:10px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:10px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("sync_play_with_build", True), change=ctrl.update_frame); h.Label("Sync Play with Builder")
-                    with h.Div(style="display:flex; gap:10px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:10px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("follow_build_in_ui", True), change=ctrl.update_frame); h.Label("Follow Builder in UI")
 
                     h.Hr()
@@ -965,15 +1039,15 @@ def build_app(seq_dir: str, fps: int = 10):
                     h.Label("Scan render stride (base LOD)")
                     h.Input(type="range", min=1, max=5, step=1, v_model=("scan_stride", 1), change=ctrl.update_frame, style="width:100%")
 
-                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Label("Map pt size"); h.Input(type="range", min=1, max=8, step=1, v_model=("point_size_map", 3), change=ctrl.update_frame, style="flex:1")
                         h.Label("Opacity"); h.Input(type="range", min=0.2, max=1.0, step=0.05, v_model=("map_opacity", 0.72), change=ctrl.update_frame, style="flex:1")
-                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Label("Scan pt size"); h.Input(type="range", min=1, max=10, step=1, v_model=("point_size_scan", 5), change=ctrl.update_frame, style="flex:1")
                         h.Input(type="checkbox", v_model=("highlight_scan", True), change=ctrl.update_frame); h.Label("Highlight current scan")
 
                     h.Hr()
-                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("show_current", True), change=ctrl.update_frame); h.Label("Show current scan (left)")
                         h.Input(type="checkbox", v_model=("use_world_pose", True), change=ctrl.update_frame); h.Label("Use SLAM pose for scan")
 
@@ -986,9 +1060,9 @@ def build_app(seq_dir: str, fps: int = 10):
                     h.Input(type="range", min=0, max=0.8, step=0.02, v_model=("ds_voxel", 0.2), change=ctrl.update_frame, style="width:100%")
 
                     h.Hr()
-                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("slam_on", False), change=ctrl.start_stop_slam); h.Label("Run SLAM (live)")
-                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("loop_on", True)); h.Label("Loop closure enabled")
                     h.Label("Loop gap"); h.Input(type="number", min=10, step=1, v_model=("loop_gap", 30))
                     h.Label("Loop threshold"); h.Input(type="number", step="0.01", v_model=("loop_thresh", 0.25))
@@ -996,9 +1070,9 @@ def build_app(seq_dir: str, fps: int = 10):
                     h.Label("Loop stride (candidate step)"); h.Input(type="number", min=1, step=1, v_model=("loop_stride", 1))
                     h.Label("Map voxel (m)"); h.Input(type="range", min=0.05, max=1.0, step=0.05, v_model=("map_voxel", 0.3))
                     h.Label("ICP voxel (m)"); h.Input(type="range", min=0.1, max=1.0, step=0.05, v_model=("icp_voxel", 0.4))
-                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("rebuild_after_opt", True)); h.Label("Rebuild map after optimization")
-                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("use_fast_profile_on_build", True)); h.Label("Use Fast Profile when building")
 
                     with h.Div(style="display:flex; gap:8px; margin-top:8px;"):
