@@ -1,0 +1,2 @@
+command to run
+python .\main.py --seq_dir D:\Work\Lidar_Map_Trame\dataset\2011_10_03\2011_10_03_drive_0027_sync\velodyne_points\data --fps 10
