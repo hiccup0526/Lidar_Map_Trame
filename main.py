@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, platform, threading, time, multiprocessing, os
+import argparse, platform, threading, time, multiprocessing, os, math
 from functools import lru_cache
 from pathlib import Path
 from typing import Tuple, Optional
@@ -10,14 +10,14 @@ os.environ.setdefault("OMP_NUM_THREADS", str(max(1, multiprocessing.cpu_count())
 import numpy as np
 import vtk
 
-# Try Cupoch (GPU for ICP); fall back to Open3D (CPU)
+# Try Cupoch (GPU ICP); fall back to Open3D (CPU)
 USE_CUPOCH = False
 try:
     import cupoch as cph
     USE_CUPOCH = True
 except Exception:
     pass
-import open3d as o3d  # always available for fallback
+import open3d as o3d  # fallback
 
 from concurrent.futures import ThreadPoolExecutor
 from trame.app import get_server
@@ -144,7 +144,6 @@ def turbo_colormap(t: np.ndarray) -> np.ndarray:
     rgb = np.clip(np.stack([r, g, b], axis=1), 0.0, 1.0)
     return (rgb * 255).astype(np.uint8)
 
-# ---- small helper to build vtkMatrix from numpy ----
 def np_to_vtk_matrix(T: np.ndarray) -> vtk.vtkMatrix4x4:
     m = vtk.vtkMatrix4x4()
     for r in range(4):
@@ -154,7 +153,6 @@ def np_to_vtk_matrix(T: np.ndarray) -> vtk.vtkMatrix4x4:
 
 # --------- Backend-agnostic ICP (GPU via Cupoch, else Open3D CPU) ---------
 def icp_transform_backend(src_pts_np: np.ndarray, tgt_pts_np: np.ndarray, voxel: float, init=np.eye(4)):
-    """Return (T, fitness); uses Cupoch on GPU when available."""
     if USE_CUPOCH:
         src = cph.geometry.PointCloud()
         src.points = cph.utility.Vector3fVector(src_pts_np[:, :3].astype(np.float32, copy=False))
@@ -169,7 +167,10 @@ def icp_transform_backend(src_pts_np: np.ndarray, tgt_pts_np: np.ndarray, voxel:
             cph.registration.TransformationEstimationPointToPoint(),
             cph.registration.ICPConvergenceCriteria(max_iteration=50),
         )
-        return np.array(result.transformation, dtype=np.float32), float(getattr(result, "fitness", 1.0))
+        T = np.array(result.transformation, dtype=np.float32)
+        fit = float(getattr(result, "fitness", 1.0))
+        return T, fit
+
     # Fallback: Open3D
     src = o3d.geometry.PointCloud(); src.points = o3d.utility.Vector3dVector(src_pts_np[:, :3].astype(np.float64, copy=False))
     tgt = o3d.geometry.PointCloud(); tgt.points = o3d.utility.Vector3dVector(tgt_pts_np[:, :3].astype(np.float64, copy=False))
@@ -217,7 +218,6 @@ def scan_context_distance(sc1: np.ndarray, sc2: np.ndarray) -> float:
 class VoxelMap:
     def __init__(self, voxel=0.3):
         self.voxel = float(voxel)
-        # key -> [sx, sy, sz, si, count]
         self.acc: dict[int, list[float]] = {}
 
     def clear(self):
@@ -331,7 +331,7 @@ class SimpleSLAM(threading.Thread):
                 self.map_version += 1
             return
 
-        # Align CURRENT -> PREVIOUS (GPU ICP if available)
+        # Align CURRENT -> PREVIOUS
         T_cur_to_prev, fit = icp_transform_backend(pts_k, self.frames[k - 1], self.icp_voxel, np.eye(4))
         T_k = self.poses[-1] @ T_cur_to_prev
         self.poses.append(T_k)
@@ -343,7 +343,7 @@ class SimpleSLAM(threading.Thread):
             )
         )
 
-        # Loop closure (simple scan-context) with stride
+        # Loop closure (scan-context) with stride
         self.descs.append(make_scan_context(pts_k))
         if self.enable_loop and self.loop_on and k > self.loop_gap:
             best_j, best_d = -1, 1e9
@@ -437,13 +437,12 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # One RenderWindow, TWO viewports (left=scan, right=map)
     rw = vtk.vtkRenderWindow()
-    # IMPORTANT: off-screen can break GPU splats on Windows; only enable offscreen on non-Windows
     if not IS_WINDOWS:
         try: rw.SetOffScreenRendering(1)
         except Exception: pass
     try: rw.SetShowWindow(False)
     except Exception: pass
-    try: rw.SetMultiSamples(0)  # better with depth peeling
+    try: rw.SetMultiSamples(0)
     except Exception: pass
 
     ren_left  = vtk.vtkRenderer(); ren_left.SetBackground(0.07, 0.07, 0.10)
@@ -455,11 +454,10 @@ def build_app(seq_dir: str, fps: int = 10):
     iren = vtk.vtkRenderWindowInteractor(); iren.SetRenderWindow(rw)
     try: iren.EnableRenderOff()
     except Exception: pass
-
-    # Interactor styles (Pan Mode toggle)
-    style_trackball = vtk.vtkInteractorStyleTrackballCamera()  # default: left-rotate, middle/shift-left pan
-    style_image     = vtk.vtkInteractorStyleImage()            # left-drag pans (good for maps)
+    style_trackball = vtk.vtkInteractorStyleTrackballCamera()
+    style_image     = vtk.vtkInteractorStyleImage()
     iren.SetInteractorStyle(style_trackball)
+
     def apply_interactor_style():
         if bool(state.pan_mode):
             iren.SetInteractorStyle(style_image)
@@ -484,44 +482,38 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # ---- Pose marker (current vehicle pose) on map view ----
     marker_src = vtk.vtkConeSource()
-    marker_src.SetRadius(0.6)          # ~0.6 m
-    marker_src.SetHeight(1.8)          # ~1.8 m arrow length
-    marker_src.SetDirection(1, 0, 0)   # model x-axis points forward
+    marker_src.SetRadius(0.6)
+    marker_src.SetHeight(1.8)
+    marker_src.SetDirection(1, 0, 0)
     marker_src.SetResolution(32)
-
-    marker_mapper = vtk.vtkPolyDataMapper()
-    marker_mapper.SetInputConnection(marker_src.GetOutputPort())
-
-    marker_actor = vtk.vtkActor()
-    marker_actor.SetMapper(marker_mapper)
-    marker_actor.GetProperty().SetColor(1.0, 0.2, 0.2)  # red-ish
-    marker_actor.GetProperty().SetAmbient(0.25)
-    marker_actor.GetProperty().SetDiffuse(0.9)
-    marker_actor.GetProperty().SetSpecular(0.1)
-    marker_actor.GetProperty().SetSpecularPower(10)
-    marker_actor.SetPickable(False)
-    marker_actor.SetVisibility(False)  # hidden by default
+    marker_mapper = vtk.vtkPolyDataMapper(); marker_mapper.SetInputConnection(marker_src.GetOutputPort())
+    marker_actor = vtk.vtkActor(); marker_actor.SetMapper(marker_mapper)
+    marker_actor.GetProperty().SetColor(1.0, 0.2, 0.2)
+    marker_actor.SetPickable(False); marker_actor.SetVisibility(False)
     ren_right.AddActor(marker_actor)
 
     ren_left.ResetCamera(); ren_right.ResetCamera()
 
-    # --- State ---
-    state.trame__title = "KITTI LiDAR SLAM (GPU ICP; Split View; Sync + Fast Build)"
+    # ---------- State (YOUR requested defaults) ----------
+    state.trame__title = "KITTI LiDAR SLAM (GPU ICP; Split View; Map Publish Cap)"
     state.seq_dir = str(Path(seq_dir).resolve())
     state.frame = 0
     state.n_frames = len(files); state.max_frame = max(0, state.n_frames - 1)
 
     # viz
-    state.point_size_scan = 5; state.point_size_map = 3
+    state.point_size_scan = 1      # minimum scan pt size
+    state.point_size_map  = 1      # minimum map pt size
+    state.splat_size      = 0.20   # Gaussian size for Fast GPU splats
     state.map_opacity = 0.72
     state.color_mode = "Turbo"
     state.auto_intensity = True
     state.i_low = 0.0; state.i_high = 1.0
     state.min_d = 0.0; state.max_d = 0.0
-    state.show_current = True; state.use_world_pose = True; state.highlight_scan = True
-    state.map_stride = 2
-    state.scan_stride = 1
-    state.use_fast_mapper = False
+    state.show_current = True; state.use_world_pose = True
+    state.highlight_scan = False   # unticked
+    state.map_stride = 8           # high map render stride
+    state.scan_stride = 3          # high scan render stride
+    state.use_fast_mapper = True   # ticked at startup
     state.interacting = False
     state.pan_mode = False
 
@@ -530,55 +522,58 @@ def build_app(seq_dir: str, fps: int = 10):
     state.map_only_on_build = True
 
     # camera follow (right/map)
-    state.follow_pose = True
+    state.follow_pose = False      # unticked (you can pan freely)
     state.cam_back = 30.0
     state.cam_up   = 15.0
     state.cam_side = 0.0
 
-    # pose marker controls (shown when not following)
+    # Pose marker (visible when not following)
     state.show_pose_marker = True
     state.marker_size = 1.0
+    state.marker_auto_scale = True
+    state.marker_scale_k = 0.03
+    state.marker_size_min = 0.6
 
     # playback
     state.play = False; state.fps = int(fps)
 
-    # sync play with builder
-    state.sync_play_with_build = True
-    state.follow_build_in_ui   = True
-
-    # SLAM controls
-    state.slam_on = False; state.loop_on = True
+    # SLAM controls (Run SLAM = ON at startup)
+    state.slam_on = True           # ticked
+    state.loop_on = True
     state.icp_voxel = 0.4; state.ds_voxel = 0.2; state.map_voxel = 0.3
     state.loop_gap = 30; state.loop_thresh = 0.25; state.optimize_every = 30
     state.loop_stride = 1
     state.rebuild_after_opt = True
-    state.use_fast_profile_on_build = True
 
     # progress
     state.map_building = False; state.map_progress = 0.0
 
-    # prefetch
+    # ---- Map publish performance caps ----
+    state.max_publish_points = 600000
+    state.map_publish_every_n = 3
+    last_map_version = {"v": -1}
+    last_published_version = {"v": -1}
+    pushing = {"v": False}
+    last_fast = {"v": False}
+
+    # Prefetch
     PREFETCH = 16
     pool = ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 2))
     def prefetch(idx):
         end = min(idx + 1 + PREFETCH, state.n_frames)
         for j in range(idx + 1, end): pool.submit(load_frame, j)
 
-    # ---- Depth peeling / translucency config ----
-    def configure_translucency(render_window, renderers, enable: bool):
-        try:
-            render_window.SetMultiSamples(0)
-        except Exception:
-            pass
-        try:
-            render_window.SetAlphaBitPlanes(1 if enable else 0)
-        except Exception:
-            pass
+    # ---- Disable alpha/peeling for splats (robust) ----
+    def configure_alpha_features(render_window, renderers, enable: bool):
+        try: render_window.SetMultiSamples(0)
+        except Exception: pass
+        try: render_window.SetAlphaBitPlanes(0)   # force off for splats
+        except Exception: pass
         for r in renderers:
             try:
-                r.SetUseDepthPeeling(1 if enable else 0)
-                r.SetMaximumNumberOfPeels(8 if enable else 0)
-                r.SetOcclusionRatio(0.1 if enable else 0.0)
+                r.SetUseDepthPeeling(0)
+                r.SetMaximumNumberOfPeels(0)
+                r.SetOcclusionRatio(0.0)
             except Exception:
                 pass
 
@@ -599,10 +594,6 @@ def build_app(seq_dir: str, fps: int = 10):
         s.ds_voxel = float(state.ds_voxel); s.loop_on = bool(state.loop_on)
         return s
 
-    last_map_version = {"v": -1}
-    pushing = {"v": False}
-    last_fast = {"v": False}  # track mapper mode to run self-test on enable
-
     def push_view():
         if not pushing["v"]:
             pushing["v"] = True
@@ -615,52 +606,51 @@ def build_app(seq_dir: str, fps: int = 10):
         out = np.zeros_like(points); out[:, :3] = Pw; out[:, 3] = points[:, 3] if points.shape[1] > 3 else 0.0
         return out
 
-    # ---- GPU splats self-test (auto-revert if it fails) ----
-    def gpu_splats_self_test() -> bool:
+    # ---- GPU splats self-test ----
+    def gpu_splats_self_test(poly_for_test=None) -> bool:
         try:
-            # tiny tri of points
-            test = np.array([[0,0,0,1],[1,0,0,1],[0,1,0,1]], np.float32)
-            poly = np_points_to_polydata(test, state.color_mode, (0.0, 1.0))
-            # temporarily force fast mapper on map actor
-            prev_mapper = map_actor.GetMapper()
-            map_actor.SetMapper(map_mapper_fast)
-            map_mapper_fast.SetInputData(poly)
-            ren_right.ResetCamera()
+            if poly_for_test is None:
+                test = np.array([[0,0,0,1],[1,0,0,1],[0,1,0,1]], np.float32)
+                poly_for_test = np_points_to_polydata(test, state.color_mode, (0.0, 1.0))
             rw.Render()
-
             w2i = vtk.vtkWindowToImageFilter()
             w2i.SetInput(rw)
             w2i.ReadFrontBufferOff()
             w2i.Update()
             img = vtk_to_numpy(w2i.GetOutput().GetPointData().GetScalars())
-            ok = img is not None and img.size and img.max() > 0
-            map_actor.SetMapper(prev_mapper)
-            return bool(ok)
+            return bool(img is not None and img.size and img.max() > 0)
         except Exception:
             return False
 
-    # ---- Mapper swap with safe render-state ----
+    # ---- Mapper swapping (robust) ----
     def swap_map_mapper():
         want_fast = bool(state.use_fast_mapper)
         is_fast   = isinstance(map_actor.GetMapper(), vtk.vtkPointGaussianMapper)
 
         if want_fast and not is_fast:
-            # Windows off-screen causes black output for splats => disable offscreen if needed
             if IS_WINDOWS:
                 try: rw.SetOffScreenRendering(0)
                 except Exception: pass
-            configure_translucency(rw, (ren_left, ren_right), True)
+            configure_alpha_features(rw, (ren_left, ren_right), False)
+            try: rw.SetMultiSamples(0)
+            except Exception: pass
+
             map_actor.SetMapper(map_mapper_fast)
-            # Opaque is the most reliable for splats
             map_actor.GetProperty().SetOpacity(1.0)
+            map_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
+
+            ok = gpu_splats_self_test(map_mapper_fast.GetInput())
+            if not ok:
+                map_actor.SetMapper(map_mapper_std)
+                configure_alpha_features(rw, (ren_left, ren_right), False)
+                map_actor.GetProperty().SetOpacity(float(state.map_opacity))
+                state.use_fast_mapper = False
+                print("[WARN] Fast GPU splats failed; reverting to standard mapper.")
+
         elif not want_fast and is_fast:
             map_actor.SetMapper(map_mapper_std)
-            configure_translucency(rw, (ren_left, ren_right), False)
-            # Restore UI opacity
-            try:
-                map_actor.GetProperty().SetOpacity(float(state.map_opacity))
-            except Exception:
-                map_actor.GetProperty().SetOpacity(0.72)
+            configure_alpha_features(rw, (ren_left, ren_right), False)
+            map_actor.GetProperty().SetOpacity(float(state.map_opacity))
 
     def swap_scan_mapper():
         want_fast = bool(state.use_fast_mapper)
@@ -670,15 +660,27 @@ def build_app(seq_dir: str, fps: int = 10):
             if IS_WINDOWS:
                 try: rw.SetOffScreenRendering(0)
                 except Exception: pass
-            configure_translucency(rw, (ren_left, ren_right), True)
+            configure_alpha_features(rw, (ren_left, ren_right), False)
+            try: rw.SetMultiSamples(0)
+            except Exception: pass
+
             scan_actor.SetMapper(scan_mapper_fast)
             scan_actor.GetProperty().SetOpacity(1.0)
+            scan_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
+
+            ok = gpu_splats_self_test(scan_mapper_fast.GetInput())
+            if not ok:
+                scan_actor.SetMapper(scan_mapper_std)
+                configure_alpha_features(rw, (ren_left, ren_right), False)
+                scan_actor.GetProperty().SetOpacity(1.0)
+                state.use_fast_mapper = False
+                print("[WARN] Fast GPU splats failed; reverting to standard mapper.")
+
         elif not want_fast and is_fast:
             scan_actor.SetMapper(scan_mapper_std)
-            configure_translucency(rw, (ren_left, ren_right), False)
-            scan_actor.GetProperty().SetOpacity(1.0)  # scan usually opaque
+            configure_alpha_features(rw, (ren_left, ren_right), False)
+            scan_actor.GetProperty().SetOpacity(1.0)
 
-    # ---- intensity window ----
     def iw_for_render():
         if state.auto_intensity:
             return (1.0, 0.0)  # hi<=lo => auto
@@ -708,7 +710,7 @@ def build_app(seq_dir: str, fps: int = 10):
         cam.SetViewUp(float(up[0]), float(up[1]), float(up[2]))
         ren_right.ResetCameraClippingRange()
 
-    # ---- Pose marker (show when follow_pose is OFF) ----
+    # ---- Pose marker (visible when not following) ----
     def update_pose_marker():
         nonlocal slam
         try:
@@ -730,19 +732,21 @@ def build_app(seq_dir: str, fps: int = 10):
                 return
             T = slam.poses[idx].copy()
 
-        # Build orientation basis: columns = [fwd, left, up]
         p, fwd, left, up = extract_pose_vectors(T)
-        R = np.column_stack((fwd, left, up))          # 3x3
-        Tw = np.eye(4, dtype=np.float32)
-        Tw[:3, :3] = R
-        Tw[:3,  3] = p
-
+        R = np.column_stack((fwd, left, up))
+        Tw = np.eye(4, dtype=np.float32); Tw[:3, :3] = R; Tw[:3, 3] = p
         marker_actor.SetUserMatrix(np_to_vtk_matrix(Tw))
-        s = max(0.2, float(as_float(state.marker_size, 1.0)))
+
+        s = float(as_float(state.marker_size, 1.0))
+        if bool(state.marker_auto_scale):
+            cam = ren_right.GetActiveCamera()
+            cpos = np.array(cam.GetPosition(), dtype=float)
+            dist = max(1.0, float(np.linalg.norm(cpos - p)))
+            s = max(float(as_float(state.marker_size_min, 0.6)), min(float(as_float(state.marker_size, 1.0)), float(as_float(state.marker_scale_k, 0.03)) * dist))
         marker_actor.SetScale(s, s, s)
         marker_actor.SetVisibility(True)
 
-    # ---- View layout (split / map-only during build) ----
+    # ---- View layout ----
     def update_view_layout():
         map_only = bool(state.map_only_on_build) and bool(state.map_building)
         split = bool(state.split_view) and not map_only
@@ -767,8 +771,7 @@ def build_app(seq_dir: str, fps: int = 10):
         scan_mapper_std.SetInputData(poly)
         scan_mapper_fast.SetInputData(poly)
         if isinstance(scan_actor.GetMapper(), vtk.vtkPointGaussianMapper):
-            scale = (0.10 if state.interacting else 0.12) * as_float(state.point_size_scan)
-            scan_mapper_fast.SetScaleFactor(max(0.18, scale))
+            scan_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
         else:
             div = 2 if state.interacting else 1
             ps_scan = max(1, as_int(state.point_size_scan))
@@ -787,11 +790,21 @@ def build_app(seq_dir: str, fps: int = 10):
             running = bool(slam.running)
             pts = slam.latest_map
         state.map_progress = prog; state.map_building = running
+
+        # Publish-skipping while building
+        if running and last_published_version["v"] >= 0:
+            if (ver - last_published_version["v"]) < max(1, as_int(state.map_publish_every_n, 3)):
+                return
+
         if ver == last_map_version["v"]:
             return
         last_map_version["v"] = ver
 
+        # Cap publish size with adaptive stride
         s = stride_for_map()
+        cap = max(100_000, as_int(state.max_publish_points, 600000))
+        if len(pts) > cap:
+            s = max(s, int(math.ceil(len(pts) / cap)))
         if s > 1 and len(pts) > 0:
             pts = pts[::s]
 
@@ -799,18 +812,18 @@ def build_app(seq_dir: str, fps: int = 10):
         map_mapper_std.SetInputData(poly)
         map_mapper_fast.SetInputData(poly)
         if isinstance(map_actor.GetMapper(), vtk.vtkPointGaussianMapper):
-            map_mapper_fast.SetScaleFactor(max(0.18, (0.10 if state.interacting else 0.10) * as_float(state.point_size_map)))
+            map_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
         else:
             div = 2 if state.interacting else 1
             ps_map = max(1, as_int(state.point_size_map))
             map_actor.GetProperty().SetPointSize(max(1, ps_map // div))
-        # std mapper honors UI opacity; fast mapper forced to 1.0 in swap
-        if not isinstance(map_actor.GetMapper(), vtk.vtkPointGaussianMapper):
             map_actor.GetProperty().SetOpacity(float(state.map_opacity))
         swap_map_mapper()
 
         if len(pts) > 0:
             fit_camera_once(ren_right, side="right", margin=2.4)
+
+        last_published_version["v"] = ver
 
     def update_frame():
         idx = int(state.frame)
@@ -820,18 +833,16 @@ def build_app(seq_dir: str, fps: int = 10):
         update_view_layout()
         update_pose_marker()
 
-        # When user just enabled fast mapper, self-test it and auto-revert on failure
+        # Validate fast splats on first use
         if state.use_fast_mapper and not last_fast["v"]:
-            # on Windows, offscreen must be off for splats
             if IS_WINDOWS:
                 try: rw.SetOffScreenRendering(0)
                 except Exception: pass
             ok = gpu_splats_self_test()
             if not ok:
-                # revert
                 state.use_fast_mapper = False
                 swap_map_mapper(); swap_scan_mapper()
-                print("[WARN] Fast GPU splats not supported on this driver/context; reverted to standard mapper.")
+                print("[WARN] Fast GPU splats not supported; reverted to standard mapper.")
             last_fast["v"] = bool(state.use_fast_mapper)
         elif not state.use_fast_mapper and last_fast["v"]:
             last_fast["v"] = False
@@ -840,37 +851,10 @@ def build_app(seq_dir: str, fps: int = 10):
 
     ctrl.update_frame = update_frame
 
-    # Fast Build Profile
-    def apply_fast_build_profile_py():
-        state.ds_voxel   = 0.35
-        state.icp_voxel  = 0.6
-        state.map_voxel  = 0.45
-        state.loop_gap       = 60
-        state.loop_thresh    = 0.35
-        state.optimize_every = 120
-        state.loop_stride    = 3
-        state.map_stride  = max(4, as_int(state.map_stride, 2))
-        state.scan_stride = max(2, as_int(state.scan_stride, 1))
-        state.use_fast_mapper = True
-        ctrl.update_frame()
-
-    ctrl.apply_fast_build_profile = apply_fast_build_profile_py
-
     # periodic refresh
     @ctrl.trigger("refresh_map")
     def _refresh_map():
         if not state.interacting:
-            # follow builder progress in UI
-            if state.follow_build_in_ui and slam is not None:
-                try:
-                    with slam.lock:
-                        built_idx = int(slam.idx)
-                except Exception:
-                    built_idx = int(state.frame)
-                if built_idx > int(state.frame):
-                    state.frame = min(built_idx, state.n_frames - 1)
-                    if state.show_current:
-                        update_scan_actor(int(state.frame))
             update_map_actor()
             update_camera_follow_right()
             update_view_layout()
@@ -883,7 +867,7 @@ def build_app(seq_dir: str, fps: int = 10):
         if state.n_frames <= 0 or not state.play or state.interacting:
             return
         # avoid outrunning the builder
-        if state.sync_play_with_build and slam is not None and state.map_building:
+        if slam is not None and state.map_building:
             try:
                 with slam.lock:
                     built_idx = int(slam.idx)
@@ -922,20 +906,24 @@ def build_app(seq_dir: str, fps: int = 10):
     ctrl.start_stop_slam = start_stop_slam
 
     def build_full_map():
-        """Start SLAM from scratch; clear map actor; optionally switch to map-only view; optionally apply fast profile."""
-        nonlocal slam
+        """Start SLAM from scratch; cap publish size; relax optimization cadence."""
+        nonlocal slam, last_published_version
         empty = np_points_to_polydata(np.empty((0, 4), np.float32), state.color_mode, (0.0, 1.0))
         map_mapper_std.SetInputData(empty); map_mapper_fast.SetInputData(empty)
         ctrl.view_update()
 
-        if bool(state.use_fast_profile_on_build):
-            apply_fast_build_profile_py()
-
         if slam is not None and slam.is_alive():
             slam.stop(); time.sleep(0.05)
+        # Relax optimization cadence for long sequences
+        n = len(files)
+        state.optimize_every = max(200, n // 3)
+        state.loop_stride    = max(2, state.loop_stride)
+        state.map_voxel      = max(0.35, as_float(state.map_voxel, 0.3))
+
         slam = make_slam()
         state.map_building = True; state.map_progress = 0.0
         last_map_version["v"] = -1
+        last_published_version["v"] = -1
         _first_fit_done["left"] = False; _first_fit_done["right"] = False
         slam.start()
         update_view_layout(); ctrl.view_update()
@@ -953,7 +941,7 @@ def build_app(seq_dir: str, fps: int = 10):
     def reset_map():
         nonlocal slam
         if slam is not None and slam.is_alive(): slam.stop(); time.sleep(0.05)
-        slam = None; last_map_version["v"] = -1
+        slam = None; last_map_version["v"] = -1; last_published_version["v"] = -1
         _first_fit_done["left"] = False; _first_fit_done["right"] = False
         empty = np_points_to_polydata(np.empty((0,4), np.float32), state.color_mode, (0.0, 1.0))
         map_mapper_std.SetInputData(empty); map_mapper_fast.SetInputData(empty)
@@ -972,10 +960,10 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # ---------- UI ----------
     with SinglePageLayout(server) as layout:
-        layout.title.set_text("KITTI LiDAR SLAM (GPU ICP; Split View; Sync + Fast Build)")
+        layout.title.set_text("KITTI LiDAR SLAM (GPU ICP; Split View; Map Publish Cap)")
         with layout.content:
             with h.Div(style="display:flex; gap:12px; align-items:flex-start; padding:12px;"):
-                with h.Div(style="width:600px; min-width:320px;"):
+                with h.Div(style="width:620px; min-width:320px;"):
                     h.Div(children=["Sequence: ", h.Code(children=[state.seq_dir])])
                     h.Hr()
                     h.Label("Frame")
@@ -1001,13 +989,15 @@ def build_app(seq_dir: str, fps: int = 10):
                         h.Input(type="checkbox", v_model=("split_view", True), change=ctrl.update_frame); h.Label("Split view (Scan | Map)")
                     with h.Div(style="display:flex; gap:10px; align-items:center;"):
                         h.Input(type="checkbox", v_model=("map_only_on_build", True), change=ctrl.update_frame); h.Label("Map-only during Build Full Map")
-
                     with h.Div(style="display:flex; gap:10px; align-items:center; margin-top:6px;"):
                         h.Input(type="checkbox", v_model=("pan_mode", False), change=ctrl.apply_interactor_style); h.Label("Pan Mode (left-drag pans)")
 
                     with h.Div(style="display:flex; gap:8px; align-items:center; margin-top:6px;"):
-                        h.Input(type="checkbox", v_model=("use_fast_mapper", False), change=ctrl.update_frame)
+                        h.Input(type="checkbox", v_model=("use_fast_mapper", True), change=ctrl.update_frame)
                         h.Label("Use Fast GPU splats (turn OFF if artifacts)")
+                    with h.Div(style="display:flex; gap:10px; align-items:center; margin-top:4px;"):
+                        h.Label("Gaussian splat size")
+                        h.Input(type="range", min=0.05, max=1.2, step=0.01, v_model=("splat_size", 0.20), change=ctrl.update_frame, style="flex:1")
 
                     with h.Div(style="display:flex; gap:12px; align-items:center; margin-top:6px;"):
                         h.Input(type="checkbox", v_model=("auto_intensity", True), change=ctrl.update_frame); h.Label("Auto intensity window")
@@ -1017,34 +1007,28 @@ def build_app(seq_dir: str, fps: int = 10):
 
                     h.Hr()
                     with h.Div(style="display:flex; gap:10px; align-items:center;"):
-                        h.Input(type="checkbox", v_model=("follow_pose", True), change=ctrl.update_frame); h.Label("Follow current pose (map/right)")
+                        h.Input(type="checkbox", v_model=("follow_pose", False), change=ctrl.update_frame); h.Label("Follow current pose (map/right)")
                     with h.Div(style="display:flex; gap:10px; align-items:center;"):
                         h.Input(type="checkbox", v_model=("show_pose_marker", True), change=ctrl.update_frame); h.Label("Show pose marker when not following")
+                    with h.Div(style="display:flex; gap:10px; align-items:center;"):
+                        h.Input(type="checkbox", v_model=("marker_auto_scale", True), change=ctrl.update_frame); h.Label("Marker auto-scale by camera distance")
                     with h.Div(style="display:flex; gap:8px; align-items:center;"):
-                        h.Label("Marker size"); h.Input(type="range", min=0.3, max=3.0, step=0.1, v_model=("marker_size", 1.0), change=ctrl.update_frame, style="flex:1")
+                        h.Label("Marker size (cap)"); h.Input(type="range", min=0.3, max=15.0, step=0.1, v_model=("marker_size", 1.0), change=ctrl.update_frame, style="flex:1")
                     with h.Div(style="display:flex; gap:8px; align-items:center;"):
-                        h.Label("Back"); h.Input(type="number", step="1", v_model=("cam_back", 30.0), change=ctrl.update_frame, style="width:30%")
-                        h.Label("Up");   h.Input(type="number", step="1", v_model=("cam_up", 15.0), change=ctrl.update_frame, style="width:30%")
-                        h.Label("Side (+L/-R)"); h.Input(type="number", step="1", v_model=("cam_side", 0.0), change=ctrl.update_frame, style="width:30%")
-
-                    h.Hr()
-                    with h.Div(style="display:flex; gap:10px; align_items:center;"):
-                        h.Input(type="checkbox", v_model=("sync_play_with_build", True), change=ctrl.update_frame); h.Label("Sync Play with Builder")
-                    with h.Div(style="display:flex; gap:10px; align_items:center;"):
-                        h.Input(type="checkbox", v_model=("follow_build_in_ui", True), change=ctrl.update_frame); h.Label("Follow Builder in UI")
+                        h.Label("Auto min"); h.Input(type="number", step="0.1", v_model=("marker_size_min", 0.6), change=ctrl.update_frame, style="width:30%")
+                        h.Label("Auto scale k"); h.Input(type="number", step="0.005", v_model=("marker_scale_k", 0.03), change=ctrl.update_frame, style="width:40%")
 
                     h.Hr()
                     h.Label("Map render stride (base LOD)")
-                    h.Input(type="range", min=1, max=10, step=1, v_model=("map_stride", 2), change=ctrl.update_frame, style="width:100%")
+                    h.Input(type="range", min=1, max=10, step=1, v_model=("map_stride", 8), change=ctrl.update_frame, style="width:100%")
                     h.Label("Scan render stride (base LOD)")
-                    h.Input(type="range", min=1, max=5, step=1, v_model=("scan_stride", 1), change=ctrl.update_frame, style="width:100%")
-
+                    h.Input(type="range", min=1, max=5, step=1, v_model=("scan_stride", 3), change=ctrl.update_frame, style="width:100%")
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Label("Map pt size"); h.Input(type="range", min=1, max=8, step=1, v_model=("point_size_map", 3), change=ctrl.update_frame, style="flex:1")
+                        h.Label("Map pt size"); h.Input(type="range", min=1, max=8, step=1, v_model=("point_size_map", 1), change=ctrl.update_frame, style="flex:1")
                         h.Label("Opacity"); h.Input(type="range", min=0.2, max=1.0, step=0.05, v_model=("map_opacity", 0.72), change=ctrl.update_frame, style="flex:1")
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Label("Scan pt size"); h.Input(type="range", min=1, max=10, step=1, v_model=("point_size_scan", 5), change=ctrl.update_frame, style="flex:1")
-                        h.Input(type="checkbox", v_model=("highlight_scan", True), change=ctrl.update_frame); h.Label("Highlight current scan")
+                        h.Label("Scan pt size"); h.Input(type="range", min=1, max=10, step=1, v_model=("point_size_scan", 1), change=ctrl.update_frame, style="flex:1")
+                        h.Input(type="checkbox", v_model=("highlight_scan", False), change=ctrl.update_frame); h.Label("Highlight current scan")
 
                     h.Hr()
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
@@ -1061,7 +1045,7 @@ def build_app(seq_dir: str, fps: int = 10):
 
                     h.Hr()
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Input(type="checkbox", v_model=("slam_on", False), change=ctrl.start_stop_slam); h.Label("Run SLAM (live)")
+                        h.Input(type="checkbox", v_model=("slam_on", True), change=ctrl.start_stop_slam); h.Label("Run SLAM (live)")
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("loop_on", True)); h.Label("Loop closure enabled")
                     h.Label("Loop gap"); h.Input(type="number", min=10, step=1, v_model=("loop_gap", 30))
@@ -1072,18 +1056,21 @@ def build_app(seq_dir: str, fps: int = 10):
                     h.Label("ICP voxel (m)"); h.Input(type="range", min=0.1, max=1.0, step=0.05, v_model=("icp_voxel", 0.4))
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("rebuild_after_opt", True)); h.Label("Rebuild map after optimization")
-                    with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Input(type="checkbox", v_model=("use_fast_profile_on_build", True)); h.Label("Use Fast Profile when building")
+
+                    h.Hr()
+                    h.Label("Map publish caps (for performance)")
+                    with h.Div(style="display:flex; gap:8px; align-items:center;"):
+                        h.Label("Max points to publish"); h.Input(type="number", min=100000, step=50000, v_model=("max_publish_points", 600000), change=ctrl.update_frame, style="width:40%")
+                        h.Label("Publish every N versions"); h.Input(type="number", min=1, step=1, v_model=("map_publish_every_n", 3), change=ctrl.update_frame, style="width:30%")
 
                     with h.Div(style="display:flex; gap:8px; margin-top:8px;"):
                         h.Button("Build Full Map (run to end)", click=ctrl.build_full_map, style="flex:2")
-                        h.Button("Fast Build Profile (apply)", click=ctrl.apply_fast_build_profile, style="flex:1")
                         h.Button("Force Rebuild Now", click=ctrl.force_rebuild, style="flex:1")
                         h.Button("Reset Map/SLAM", click=ctrl.reset_map, style="flex:1")
 
                     with h.Div(style="margin-top:6px; font-size:12px; opacity:0.8;"):
                         h.Div(children=["Map: ", h.Span(children=["{{ (map_progress*100).toFixed(1) }}%"]), "  ", h.Span(children=["{{ map_building ? '(running)' : '' }}"])])
-                        # Pause refresh during interaction; also throttle server pushes
+                        # Pause refresh during interaction; throttle server pushes
                         h.Script("""
                         (function(){
                           const root = document.querySelector('.vtk-wrap');
@@ -1091,7 +1078,7 @@ def build_app(seq_dir: str, fps: int = 10):
                           window._pauseHooksSet = true;
 
                           function stopTimer(){ if (window._mapTimer){ clearInterval(window._mapTimer); window._mapTimer = null; } }
-                          function startTimer(){ if (!window._mapTimer){ window._mapTimer = setInterval(()=>{ try{ trigger('refresh_map'); }catch(e){} }, 900); } }
+                          function startTimer(){ if (!window._mapTimer){ window._mapTimer = setInterval(()=>{ try{ trigger('refresh_map'); }catch(e){} }, 700); } }
 
                           let resumeT = null, interT = null;
                           function markInteractingKick(){
@@ -1100,13 +1087,13 @@ def build_app(seq_dir: str, fps: int = 10):
                               try { trigger('set_interacting', 1); } catch(e){}
                             }
                             if (interT) clearTimeout(interT);
-                            interT = setTimeout(()=>{ window._interacting = false; try { trigger('set_interacting', 0); } catch(e){} }, 260);
+                            interT = setTimeout(()=>{ window._interacting = false; try { trigger('set_interacting', 0); } catch(e){} }, 250);
                           }
                           const pauseThenResume = () => {
                             stopTimer();
                             markInteractingKick();
                             if (resumeT) clearTimeout(resumeT);
-                            resumeT = setTimeout(startTimer, 280);
+                            resumeT = setTimeout(startTimer, 260);
                           };
                           root.addEventListener('mousedown', pauseThenResume, {passive:true});
                           root.addEventListener('mousemove', pauseThenResume, {passive:true});
@@ -1126,8 +1113,8 @@ def build_app(seq_dir: str, fps: int = 10):
                         interactive_ratio=6,
                         interactive_quality=35,
                         still_ratio=1,
-                        still_quality=72,
-                        max_image_size=900,
+                        still_quality=60,    # lower to reduce PNG size
+                        max_image_size=720,  # cap output resolution to reduce bandwidth
                     ) as view:
                         def _safe_update():
                             try: view.update()
@@ -1135,6 +1122,11 @@ def build_app(seq_dir: str, fps: int = 10):
                         ctrl.view_update = _safe_update
                         ctrl.update_frame()
                         ctrl.apply_interactor_style()
+
+    # Start SLAM immediately if requested at startup
+    if state.slam_on:
+        try: ctrl.start_stop_slam()
+        except Exception: pass
 
     return server
 
