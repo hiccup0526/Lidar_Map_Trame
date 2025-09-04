@@ -2,11 +2,12 @@ from __future__ import annotations
 """
 KITTI LiDAR viewer + simple SLAM (ICP + scan-context)
 - Split view: left (current scan), right (global map)
-- Persistent, always-on-top pose marker (overlay renderer)
+- Persistent pose marker (overlay on the right view)
 - CPU⇄GPU toggle for ICP (GPU via Cupoch if available)
 - Fast GPU splats path (PointGaussianMapper) with robust fallback
 - Performance caps for map publishing
 - Pan Mode ON by default => left-drag pans (no rotate)
+- Web display reliability fixes (render window / layers / alpha/peeling)
 
 Requested defaults:
 - Use Fast GPU splats = ON
@@ -459,21 +460,27 @@ def build_app(seq_dir: str, fps: int = 10):
     server = get_server(client_type="vue2")
     state, ctrl = server.state, server.controller
 
-    # One RenderWindow, TWO base renderers + 1 overlay for marker
+    # ----- Render window (reliable setup for web remote view) -----
     rw = vtk.vtkRenderWindow()
+    # Multi-layer is needed for overlay marker
     try: rw.SetNumberOfLayers(2)
     except Exception: pass
-    if not IS_WINDOWS:
+    # Offscreen: leave OFF on Windows; ON elsewhere is fine for server-side rendering
+    if IS_WINDOWS:
+        try: rw.SetOffScreenRendering(0)
+        except Exception: pass
+    else:
         try: rw.SetOffScreenRendering(1)
         except Exception: pass
-    try: rw.SetShowWindow(False)
-    except Exception: pass
+    # Avoid hiding anything
     try: rw.SetMultiSamples(0)
     except Exception: pass
+    try: rw.SetAlphaBitPlanes(0)
+    except Exception: pass
 
+    # Two main renderers + one overlay for marker (on right view)
     ren_left  = vtk.vtkRenderer(); ren_left.SetBackground(0.07, 0.07, 0.10)
     ren_right = vtk.vtkRenderer(); ren_right.SetBackground(0.05, 0.05, 0.08)
-    # Overlay renderer for marker (always on top)
     ren_marker = vtk.vtkRenderer()
     try: ren_marker.SetLayer(1)
     except Exception: pass
@@ -484,11 +491,13 @@ def build_app(seq_dir: str, fps: int = 10):
     rw.AddRenderer(ren_right)
     rw.AddRenderer(ren_marker)
 
+    # Initial layout (split)
     ren_left.SetViewport(0.0, 0.0, 0.5, 1.0)
     ren_right.SetViewport(0.5, 0.0, 1.0, 1.0)
     ren_marker.SetViewport(ren_right.GetViewport())
     ren_marker.SetActiveCamera(ren_right.GetActiveCamera())
 
+    # Interactor
     iren = vtk.vtkRenderWindowInteractor(); iren.SetRenderWindow(rw)
     try: iren.EnableRenderOff()
     except Exception: pass
@@ -520,8 +529,8 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # ---- Pose marker (overlay) ----
     marker_src = vtk.vtkConeSource()
-    marker_src.SetRadius(0.6)
-    marker_src.SetHeight(1.8)
+    marker_src.SetRadius(0.8)       # slightly bigger for visibility
+    marker_src.SetHeight(2.4)
     marker_src.SetDirection(1, 0, 0)
     marker_src.SetResolution(32)
 
@@ -532,15 +541,14 @@ def build_app(seq_dir: str, fps: int = 10):
     marker_actor.SetMapper(marker_mapper)
     marker_actor.SetPickable(False)
     marker_actor.SetVisibility(False)
-
-    marker_prop = marker_actor.GetProperty()
-    marker_prop.SetColor(1.0, 0.2, 0.2)
-    marker_prop.SetLighting(False)
-    try: marker_prop.SetDepthTestOff()
+    mp = marker_actor.GetProperty()
+    mp.SetColor(1.0, 0.2, 0.2)
+    mp.SetLighting(False)
+    try: mp.SetDepthTestOff()   # always on top
     except Exception: pass
-
     ren_marker.AddActor(marker_actor)
 
+    # Start with valid cameras
     ren_left.ResetCamera(); ren_right.ResetCamera()
 
     # ---------- State (requested defaults) ----------
@@ -567,8 +575,8 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # layout & interaction
     state.split_view = True
-    state.map_only_on_build = True
-    state.pan_mode = True        # Pan Mode ON => left-drag pans by default
+    state.map_only_on_build = False   # safer default so you always see something
+    state.pan_mode = True
 
     # camera follow (right/map)
     state.follow_pose = False
@@ -578,10 +586,10 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # Pose marker
     state.show_pose_marker = True
-    state.marker_size = 1.0
+    state.marker_size = 2.5
     state.marker_auto_scale = True
-    state.marker_scale_k = 0.03
-    state.marker_size_min = 0.6
+    state.marker_scale_k = 0.035
+    state.marker_size_min = 1.0
 
     # playback
     state.play = False; state.fps = int(fps)
@@ -608,6 +616,8 @@ def build_app(seq_dir: str, fps: int = 10):
     last_published_version = {"v": -1}
     pushing = {"v": False}
     last_fast = {"v": False}
+    _last_push = {"t": 0.0}
+    MIN_PUSH_DT = 1.0 / 12.0  # cap pushes to ~12 fps
 
     # Prefetch
     PREFETCH = 24
@@ -616,8 +626,8 @@ def build_app(seq_dir: str, fps: int = 10):
         end = min(idx + 1 + PREFETCH, state.n_frames)
         for j in range(idx + 1, end): pool.submit(load_frame, j)
 
-    # ---- Disable alpha/peeling for splats (robust) ----
-    def configure_alpha_features(render_window, renderers, enable: bool):
+    # ---- disable alpha/peeling (robust for splats & remote view) ----
+    def configure_alpha_features(render_window, renderers):
         try: render_window.SetMultiSamples(0)
         except Exception: pass
         try: render_window.SetAlphaBitPlanes(0)
@@ -629,12 +639,8 @@ def build_app(seq_dir: str, fps: int = 10):
                 r.SetOcclusionRatio(0.0)
             except Exception:
                 pass
-        try:
-            ren_marker.SetUseDepthPeeling(0)
-            ren_marker.SetMaximumNumberOfPeels(0)
-            ren_marker.SetOcclusionRatio(0.0)
-        except Exception:
-            pass
+
+    configure_alpha_features(rw, (ren_left, ren_right, ren_marker))
 
     # SLAM worker
     slam: Optional[SimpleSLAM] = None
@@ -654,10 +660,15 @@ def build_app(seq_dir: str, fps: int = 10):
         return s
 
     def push_view():
-        if not pushing["v"]:
-            pushing["v"] = True
-            try: ctrl.view_update()
-            finally: pushing["v"] = False
+        now = time.perf_counter()
+        if pushing["v"] or (now - _last_push["t"] < MIN_PUSH_DT):
+            return
+        pushing["v"] = True
+        try:
+            ctrl.view_update()
+        finally:
+            pushing["v"] = False
+            _last_push["t"] = time.perf_counter()
 
     def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
         if points.size == 0: return points
@@ -671,6 +682,8 @@ def build_app(seq_dir: str, fps: int = 10):
             if poly_for_test is None:
                 test = np.array([[0,0,0,1],[1,0,0,1],[0,1,0,1]], np.float32)
                 poly_for_test = np_points_to_polydata(test, state.color_mode, (0.0, 1.0))
+            map_mapper_fast.SetInputData(poly_for_test)
+            scan_mapper_fast.SetInputData(poly_for_test)
             rw.Render()
             w2i = vtk.vtkWindowToImageFilter()
             w2i.SetInput(rw)
@@ -685,59 +698,31 @@ def build_app(seq_dir: str, fps: int = 10):
     def swap_map_mapper():
         want_fast = bool(state.use_fast_mapper)
         is_fast   = isinstance(map_actor.GetMapper(), vtk.vtkPointGaussianMapper)
-
         if want_fast and not is_fast:
-            if IS_WINDOWS:
-                try: rw.SetOffScreenRendering(0)
-                except Exception: pass
-            configure_alpha_features(rw, (ren_left, ren_right, ren_marker), False)
-            try: rw.SetMultiSamples(0)
-            except Exception: pass
-
             map_actor.SetMapper(map_mapper_fast)
             map_actor.GetProperty().SetOpacity(1.0)
             map_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
-
-            ok = gpu_splats_self_test(map_mapper_fast.GetInput())
-            if not ok:
+            if not gpu_splats_self_test(map_actor.GetMapper().GetInput()):
                 map_actor.SetMapper(map_mapper_std)
-                configure_alpha_features(rw, (ren_left, ren_right, ren_marker), False)
                 map_actor.GetProperty().SetOpacity(float(state.map_opacity))
                 state.use_fast_mapper = False
-                print("[WARN] Fast GPU splats failed; reverting to standard mapper.")
-
         elif not want_fast and is_fast:
             map_actor.SetMapper(map_mapper_std)
-            configure_alpha_features(rw, (ren_left, ren_right, ren_marker), False)
             map_actor.GetProperty().SetOpacity(float(state.map_opacity))
 
     def swap_scan_mapper():
         want_fast = bool(state.use_fast_mapper)
         is_fast   = isinstance(scan_actor.GetMapper(), vtk.vtkPointGaussianMapper)
-
         if want_fast and not is_fast:
-            if IS_WINDOWS:
-                try: rw.SetOffScreenRendering(0)
-                except Exception: pass
-            configure_alpha_features(rw, (ren_left, ren_right, ren_marker), False)
-            try: rw.SetMultiSamples(0)
-            except Exception: pass
-
             scan_actor.SetMapper(scan_mapper_fast)
             scan_actor.GetProperty().SetOpacity(1.0)
             scan_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
-
-            ok = gpu_splats_self_test(scan_mapper_fast.GetInput())
-            if not ok:
+            if not gpu_splats_self_test(scan_actor.GetMapper().GetInput()):
                 scan_actor.SetMapper(scan_mapper_std)
-                configure_alpha_features(rw, (ren_left, ren_right, ren_marker), False)
                 scan_actor.GetProperty().SetOpacity(1.0)
                 state.use_fast_mapper = False
-                print("[WARN] Fast GPU splats failed; reverting to standard mapper.")
-
         elif not want_fast and is_fast:
             scan_actor.SetMapper(scan_mapper_std)
-            configure_alpha_features(rw, (ren_left, ren_right, ren_marker), False)
             scan_actor.GetProperty().SetOpacity(1.0)
 
     def iw_for_render():
@@ -799,16 +784,16 @@ def build_app(seq_dir: str, fps: int = 10):
         Tw = np.eye(4, dtype=np.float32); Tw[:3, :3] = R; Tw[:3, 3] = p
         marker_actor.SetUserMatrix(np_to_vtk_matrix(Tw))
 
-        s = float(as_float(state.marker_size, 1.0))
+        s = float(as_float(state.marker_size, 2.5))
         if bool(state.marker_auto_scale):
             cam = ren_right.GetActiveCamera()
             cpos = np.array(cam.GetPosition(), dtype=float)
             dist = max(1.0, float(np.linalg.norm(cpos - p)))
             s = max(
-                float(as_float(state.marker_size_min, 0.6)),
+                float(as_float(state.marker_size_min, 1.0)),
                 min(
-                    float(as_float(state.marker_size, 1.0)),
-                    float(as_float(state.marker_scale_k, 0.03)) * dist,
+                    float(as_float(state.marker_size, 2.5)),
+                    float(as_float(state.marker_scale_k, 0.035)) * dist,
                 ),
             )
         marker_actor.SetScale(s, s, s)
@@ -905,9 +890,6 @@ def build_app(seq_dir: str, fps: int = 10):
 
         # Validate fast splats on first use
         if state.use_fast_mapper and not last_fast["v"]:
-            if IS_WINDOWS:
-                try: rw.SetOffScreenRendering(0)
-                except Exception: pass
             ok = gpu_splats_self_test()
             if not ok:
                 state.use_fast_mapper = False
@@ -1076,7 +1058,8 @@ def build_app(seq_dir: str, fps: int = 10):
                     with h.Div(style="display:flex; gap:10px; align-items:center;"):
                         h.Input(type="checkbox", v_model=("split_view", True), change=ctrl.update_frame); h.Label("Split view (Scan | Map)")
                     with h.Div(style="display:flex; gap:10px; align-items:center;"):
-                        h.Input(type="checkbox", v_model=("map_only_on_build", True), change=ctrl.update_frame); h.Label("Map-only during Build Full Map")
+                        h.Input(type="checkbox", v_model=("map_only_on_build", False), change=ctrl.update_frame); h.Label("Map-only during Build Full Map")
+
                     with h.Div(style="display:flex; gap:10px; align-items:center; margin-top:6px;"):
                         h.Input(type="checkbox", v_model=("pan_mode", True), change=ctrl.apply_interactor_style); h.Label("Pan Mode (left-drag pans)")
 
@@ -1101,10 +1084,10 @@ def build_app(seq_dir: str, fps: int = 10):
                     with h.Div(style="display:flex; gap:10px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("marker_auto_scale", True), change=ctrl.update_frame); h.Label("Marker auto-scale by camera distance")
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Label("Marker size (cap)"); h.Input(type="range", min=0.3, max=15.0, step=0.1, v_model=("marker_size", 1.0), change=ctrl.update_frame, style="flex:1")
+                        h.Label("Marker size (cap)"); h.Input(type="range", min=0.3, max=15.0, step=0.1, v_model=("marker_size", 2.5), change=ctrl.update_frame, style="flex:1")
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Label("Auto min"); h.Input(type="number", step="0.1", v_model=("marker_size_min", 0.6), change=ctrl.update_frame, style="width:30%")
-                        h.Label("Auto scale k"); h.Input(type="number", step="0.005", v_model=("marker_scale_k", 0.03), change=ctrl.update_frame, style="width:40%")
+                        h.Label("Auto min"); h.Input(type="number", step="0.1", v_model=("marker_size_min", 1.0), change=ctrl.update_frame, style="width:30%")
+                        h.Label("Auto scale k"); h.Input(type="number", step="0.005", v_model=("marker_scale_k", 0.035), change=ctrl.update_frame, style="width:40%")
 
                     h.Hr()
                     h.Label("Map render stride (base LOD)")
@@ -1133,7 +1116,7 @@ def build_app(seq_dir: str, fps: int = 10):
 
                     h.Hr()
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Input(type="checkbox", v_model=("use_gpu", HAVE_CUPOCH), change="trigger('toggle_gpu')"); 
+                        h.Input(type="checkbox", v_model=("use_gpu", HAVE_CUPOCH), change="trigger('toggle_gpu')")
                         h.Label(f"Use GPU (Cupoch) for ICP{' (not available)' if not HAVE_CUPOCH else ''}")
 
                     h.Hr()
@@ -1204,10 +1187,10 @@ def build_app(seq_dir: str, fps: int = 10):
                         classes="vtk-wrap",
                         style="width:100%; height:100%;",
                         interactive_ratio=6,
-                        interactive_quality=35,
+                        interactive_quality=30,
                         still_ratio=1,
-                        still_quality=60,
-                        max_image_size=720,
+                        still_quality=55,
+                        max_image_size=640,
                     ) as view:
                         def _safe_update():
                             try: view.update()
