@@ -1,28 +1,19 @@
 from __future__ import annotations
 """
-KITTI LiDAR viewer + simple SLAM (ICP + scan-context)
-- Split view: left (current scan), right (global map)
-- Persistent pose marker (overlay on the right view)
-- CPU⇄GPU toggle for ICP (GPU via Cupoch if available)
-- Fast GPU splats path (PointGaussianMapper) with robust fallback
-- Performance caps for map publishing
-- Pan Mode ON by default => left-drag pans (no rotate)
-- Web display reliability fixes (render window / layers / alpha/peeling)
-
-Requested defaults:
-- Use Fast GPU splats = ON
-- Run SLAM = ON
-- Follow current pose = OFF
-- Highlight current scan = OFF
-- Map pt size = 1, Scan pt size = 1
-- Map stride = 8, Scan stride = 3
+KITTI LiDAR viewer + simple SLAM (ICP + scan-context) — RT-optimized
+Key performance changes:
+- SLAM thread no longer builds map arrays; it only marks the map "dirty"
+- VoxelMap supports incremental updates (dirty keys -> array rows) to avoid full rebuilds
+- Map vtkPolyData is persistent; per-publish we update arrays in-place
+- Publish is throttled by map_publish_every_n and adaptive stride
+- Heavier default voxels / lazier global opt / coarser loop candidate search
 """
+
 import argparse, platform, threading, time, multiprocessing, os, math
 from functools import lru_cache
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, List
 
-# Use all CPU cores for CPU-side ops (set BEFORE heavy libs)
 os.environ.setdefault("OMP_NUM_THREADS", str(max(1, multiprocessing.cpu_count())))
 
 import numpy as np
@@ -52,18 +43,14 @@ try:
 except Exception:
     from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray, vtk_to_numpy  # type: ignore
 
-# --------- small coercion utils (fix UI strings) ---------
+# --------- small coercion utils ---------
 def as_int(v, default=0):
-    try:
-        return int(float(v))
-    except Exception:
-        return default
+    try: return int(float(v))
+    except Exception: return default
 
 def as_float(v, default=0.0):
-    try:
-        return float(v)
-    except Exception:
-        return default
+    try: return float(v)
+    except Exception: return default
 
 # --------- IO & preprocessing ---------
 def list_kitti_bins(seq_dir: str):
@@ -82,14 +69,13 @@ def load_kitti_bin(file_path: str) -> np.ndarray:
     return arr.reshape((-1, 4))
 
 def voxel_downsample(points: np.ndarray, voxel: float) -> np.ndarray:
-    """Fast CPU voxel grid that preserves intensity via mean per cell."""
     if voxel is None or voxel <= 0:
         return points
     xyz = points[:, :3].astype(np.float32, copy=False)
     ijk = np.floor(xyz / float(voxel)).astype(np.int64)
     try:
         _, inv, counts = np.unique(ijk, axis=0, return_inverse=True, return_counts=True)
-    except TypeError:  # numpy<1.24
+    except TypeError:
         ijk_view = np.ascontiguousarray(ijk).view(np.dtype((np.void, ijk.dtype.itemsize * ijk.shape[1])))
         _, inv, counts = np.unique(ijk_view, return_inverse=True, return_counts=True)
     sums_xyz = np.zeros((counts.size, 3), dtype=np.float64)
@@ -113,40 +99,31 @@ def crop_distance(points: np.ndarray, min_d: float, max_d: float) -> np.ndarray:
 def np_points_to_polydata(points: np.ndarray, color_mode: str, i_win: Tuple[float, float], constant_rgb=None) -> vtk.vtkPolyData:
     n = len(points)
     poly = vtk.vtkPolyData()
+    pts = vtk.vtkPoints()
     if n == 0:
-        poly.SetPoints(vtk.vtkPoints())
+        poly.SetPoints(pts)
         return poly
 
-    pts = vtk.vtkPoints()
     pts.SetData(numpy_to_vtk(points[:, :3].copy(), deep=True))
     poly.SetPoints(pts)
 
-    # verts
     ids = np.arange(n, dtype=np.int64)
-    cells = np.empty((n, 2), dtype=np.int64)
-    cells[:, 0] = 1
-    cells[:, 1] = ids
+    cells = np.empty((n, 2), dtype=np.int64); cells[:, 0] = 1; cells[:, 1] = ids
     ca = numpy_to_vtkIdTypeArray(cells.ravel(order="C"), deep=True)
-    verts = vtk.vtkCellArray()
-    verts.SetCells(n, ca)
+    verts = vtk.vtkCellArray(); verts.SetCells(n, ca)
     poly.SetVerts(verts)
 
-    # colors
     if constant_rgb is not None:
         colors = np.tile(np.asarray(constant_rgb, dtype=np.uint8), (n, 1))
     else:
         intens = points[:, 3] if points.shape[1] > 3 else np.zeros(n, dtype=np.float32)
         lo, hi = i_win
-        if hi <= lo:  # auto-window
+        if hi <= lo:
             lo = float(np.percentile(intens, 2.0)) if intens.size else 0.0
             hi = float(np.percentile(intens, 98.0)) if intens.size else 1.0
             if hi <= lo: hi = lo + 1.0
         t = np.clip((intens - lo) / (hi - lo), 0, 1)
-        if color_mode == "Turbo":
-            colors = turbo_colormap(t)
-        else:
-            g = (t * 255).astype(np.uint8)
-            colors = np.stack([g, g, g], axis=1)
+        colors = turbo_colormap(t) if color_mode == "Turbo" else np.stack([(t*255).astype(np.uint8)]*3, axis=1)
     vtk_colors = numpy_to_vtk(colors.astype(np.uint8), deep=True)
     vtk_colors.SetName("RGB")
     poly.GetPointData().SetScalars(vtk_colors)
@@ -170,50 +147,44 @@ def np_to_vtk_matrix(T: np.ndarray) -> vtk.vtkMatrix4x4:
             m.SetElement(r, c, float(T[r, c]))
     return m
 
-# --------- ICP backend (GPU via Cupoch when enabled; else CPU via Open3D) ---------
-USE_GPU = HAVE_CUPOCH  # runtime switch (also exposed in UI)
+# --------- ICP backend ---------
+USE_GPU = HAVE_CUPOCH
 
 def icp_transform_backend(src_pts_np: np.ndarray, tgt_pts_np: np.ndarray, voxel: float, init=np.eye(4)):
-    """ICP using Cupoch on GPU when enabled, else Open3D on CPU."""
     if USE_GPU and HAVE_CUPOCH:
-        src = cph.geometry.PointCloud()
-        src.points = cph.utility.Vector3fVector(src_pts_np[:, :3].astype(np.float32, copy=False))
-        tgt = cph.geometry.PointCloud()
-        tgt.points = cph.utility.Vector3fVector(tgt_pts_np[:, :3].astype(np.float32, copy=False))
+        src = cph.geometry.PointCloud(); src.points = cph.utility.Vector3fVector(src_pts_np[:, :3].astype(np.float32, copy=False))
+        tgt = cph.geometry.PointCloud(); tgt.points = cph.utility.Vector3fVector(tgt_pts_np[:, :3].astype(np.float32, copy=False))
         if voxel and voxel > 0:
-            src = src.voxel_down_sample(float(voxel))
-            tgt = tgt.voxel_down_sample(float(voxel))
+            src = src.voxel_down_sample(float(voxel)); tgt = tgt.voxel_down_sample(float(voxel))
         max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
         result = cph.registration.registration_icp(
             src, tgt, max_corr, init.astype(np.float32),
             cph.registration.TransformationEstimationPointToPoint(),
-            cph.registration.ICPConvergenceCriteria(max_iteration=50),
+            cph.registration.ICPConvergenceCriteria(max_iteration=25),  # fewer iters for speed
         )
         T = np.array(result.transformation, dtype=np.float32)
         fit = float(getattr(result, "fitness", 1.0))
         return T, fit
 
-    # --- CPU fallback (Open3D) ---
+    # CPU fallback
     src = o3d.geometry.PointCloud(); src.points = o3d.utility.Vector3dVector(src_pts_np[:, :3].astype(np.float64, copy=False))
     tgt = o3d.geometry.PointCloud(); tgt.points = o3d.utility.Vector3dVector(tgt_pts_np[:, :3].astype(np.float64, copy=False))
     if voxel and voxel > 0:
-        src = src.voxel_down_sample(float(voxel))
-        tgt = tgt.voxel_down_sample(float(voxel))
+        src = src.voxel_down_sample(float(voxel)); tgt = tgt.voxel_down_sample(float(voxel))
     max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
     result = o3d.pipelines.registration.registration_icp(
         src, tgt, max_corr, init,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25),
     )
     return np.array(result.transformation, dtype=np.float32), float(result.fitness)
 
-# --------- SLAM: scan-context (simple) ---------
+# --------- Scan-context ---------
 def make_scan_context(points: np.ndarray, n_ring=20, n_sector=60, max_range=80.0) -> np.ndarray:
     xyz = points[:, :3]
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
     r = np.sqrt(x*x + y*y)
-    a = np.arctan2(y, x)
-    a = (a + np.pi) / (2 * np.pi)
+    a = (np.arctan2(y, x) + np.pi) / (2 * np.pi)
     ring_idx = np.clip((r / max_range * n_ring).astype(int), 0, n_ring - 1)
     sector_idx = np.clip((a * n_sector).astype(int), 0, n_sector - 1)
     sc = np.full((n_ring, n_sector), -np.inf, dtype=np.float32)
@@ -227,7 +198,7 @@ def make_scan_context(points: np.ndarray, n_ring=20, n_sector=60, max_range=80.0
 def scan_context_distance(sc1: np.ndarray, sc2: np.ndarray) -> float:
     n_ring, n_sector = sc1.shape
     best = 1e9
-    for shift in range(n_sector):
+    for shift in range(0, n_sector, 1):
         sc2s = np.roll(sc2, shift, axis=1)
         num = (sc1 * sc2s).sum(axis=1)
         den = np.linalg.norm(sc1, axis=1) * np.linalg.norm(sc2s, axis=1) + 1e-9
@@ -236,14 +207,24 @@ def scan_context_distance(sc1: np.ndarray, sc2: np.ndarray) -> float:
         if dist < best: best = float(dist)
     return best
 
-# --------- Optimized VoxelMap ---------
+# --------- Incremental VoxelMap ---------
 class VoxelMap:
-    def __init__(self, voxel=0.3):
+    """Incrementally maintained voxel grid with dirty-key tracking."""
+    def __init__(self, voxel=0.45):
         self.voxel = float(voxel)
-        self.acc: dict[int, list[float]] = {}
+        self.acc: Dict[int, List[float]] = {}   # key -> [sumx, sumy, sumz, sumi, count]
+        self._dirty: set[int] = set()
+        # arrays (lazy)
+        self._arr: Optional[np.ndarray] = None
+        self._keys: List[int] = []
+        self._row: Dict[int, int] = {}
 
     def clear(self):
         self.acc.clear()
+        self._dirty.clear()
+        self._arr = None
+        self._keys = []
+        self._row = {}
 
     @staticmethod
     def _encode_keys(g: np.ndarray) -> np.ndarray:
@@ -270,25 +251,65 @@ class VoxelMap:
                 a[3] += float(si); a[4] += float(c)
             else:
                 self.acc[k] = [float(sxyz[0]), float(sxyz[1]), float(sxyz[2]), float(si), float(c)]
+            self._dirty.add(k)
 
-    def to_points(self) -> np.ndarray:
-        if not self.acc:
+    # --- incremental array management ---
+    def ensure_array(self):
+        if self._arr is not None:
+            return
+        self._keys = list(self.acc.keys())
+        n = len(self._keys)
+        self._arr = np.empty((max(1024, n), 4), np.float32)  # pre-allocate
+        self._row = {}
+        for i, k in enumerate(self._keys):
+            self._row[k] = i
+            a = self.acc[k]; c = max(1.0, a[4])
+            self._arr[i, 0] = a[0] / c
+            self._arr[i, 1] = a[1] / c
+            self._arr[i, 2] = a[2] / c
+            self._arr[i, 3] = a[3] / c
+        self._dirty.clear()
+
+    def apply_dirty(self):
+        if self._arr is None:
+            self.ensure_array()
+            return
+        for k in list(self._dirty):
+            a = self.acc[k]; c = max(1.0, a[4])
+            if k in self._row:
+                i = self._row[k]
+            else:
+                i = len(self._keys)
+                self._keys.append(k)
+                self._row[k] = i
+                if i >= len(self._arr):
+                    grow = max(1024, int(0.25 * (i + 1)))
+                    big = np.empty((len(self._arr) + grow, 4), np.float32)
+                    big[:len(self._arr)] = self._arr
+                    self._arr = big
+            self._arr[i, 0] = a[0] / c
+            self._arr[i, 1] = a[1] / c
+            self._arr[i, 2] = a[2] / c
+            self._arr[i, 3] = a[3] / c
+            self._dirty.remove(k)
+
+    def view_points(self) -> np.ndarray:
+        if self._arr is None:
             return np.empty((0, 4), np.float32)
-        out = np.empty((len(self.acc), 4), np.float32)
-        for i, a in enumerate(self.acc.values()):
-            c = a[4]
-            out[i, 0] = a[0] / c
-            out[i, 1] = a[1] / c
-            out[i, 2] = a[2] / c
-            out[i, 3] = a[3] / c
-        return out
+        n = len(self._keys)
+        return self._arr[:n]
 
+# --------- SimpleSLAM ---------
 class SimpleSLAM(threading.Thread):
-    """Pose graph SLAM with voxel map; publishes versioned downsampled map."""
+    """
+    Pose graph SLAM with voxel map; SLAM thread is memory-light:
+    - Only inserts into VoxelMap and marks dirty+version
+    - Does NOT allocate big arrays (no to_points here)
+    """
     def __init__(self, files, preprocess_fn,
-                 map_voxel=0.3, icp_voxel=0.4, loop_gap=30, loop_thresh=0.25,
-                 optimize_every=30, enable_loop=True, rebuild_after_opt=True,
-                 loop_stride=1):
+                 map_voxel=0.45, icp_voxel=0.8, loop_gap=90, loop_thresh=0.35,
+                 optimize_every=200, enable_loop=True, rebuild_after_opt=False,
+                 loop_stride=6, window_horizon: int = 0):
         super().__init__(daemon=True)
         self.files = files
         self.preprocess = preprocess_fn
@@ -299,23 +320,24 @@ class SimpleSLAM(threading.Thread):
         self.enable_loop = bool(enable_loop)
         self.rebuild_after_opt = bool(rebuild_after_opt)
         self.loop_stride = max(1, int(loop_stride))
+        self.window_h = int(window_horizon)  # 0 = off
 
         self.map = VoxelMap(map_voxel)
         self.pose_graph = o3d.pipelines.registration.PoseGraph()
         self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
         self.poses = [np.eye(4)]
         self.descs = [None]
-        self.frames: list[np.ndarray] = []
+        self.frames: list[np.ndarray] = []  # preprocessed local frames
 
         self.idx = 0
         self.running = False
         self.lock = threading.Lock()
-        self.latest_map = np.empty((0, 4), np.float32)
         self.progress = 0.0
         self.map_version = 0
+        self._map_dirty = False       # <-- only a flag here
 
         # live params
-        self.min_d = 0.0; self.max_d = 0.0; self.ds_voxel = 0.2; self.loop_on = True
+        self.min_d = 0.0; self.max_d = 0.0; self.ds_voxel = 0.35; self.loop_on = True
 
     def run(self):
         self.running = True
@@ -331,14 +353,22 @@ class SimpleSLAM(threading.Thread):
 
     def stop(self): self.running = False
 
-    def rebuild_map(self, upto: Optional[int] = None):
-        kmax = len(self.frames) if upto is None else min(upto + 1, len(self.frames))
-        self.map.clear()
-        for i in range(kmax):
-            self.map.insert(self.frames[i], self.poses[i])
+    def _mark_dirty(self):
         with self.lock:
-            self.latest_map = self.map.to_points()
+            self._map_dirty = True
             self.map_version += 1
+
+    def _maintain_window(self, upto_idx: int):
+        """Optional sliding window: keep last H frames by periodic rebuild on small subsets."""
+        if self.window_h <= 0:
+            return
+        keep_from = max(0, upto_idx - self.window_h)
+        # Periodically (every H//2 frames) rebuild only last H frames
+        if upto_idx > 0 and (upto_idx % max(1, self.window_h // 2) == 0):
+            self.map.clear()
+            for i in range(keep_from, upto_idx + 1):
+                self.map.insert(self.frames[i], self.poses[i])
+            self._mark_dirty()
 
     def process_one(self, k: int):
         pts_k = self.preprocess(k, self.min_d, self.max_d, self.ds_voxel)
@@ -348,24 +378,20 @@ class SimpleSLAM(threading.Thread):
         if k == 0:
             self.descs[0] = make_scan_context(pts_k)
             self.map.insert(pts_k, np.eye(4))
-            with self.lock:
-                self.latest_map = self.map.to_points()
-                self.map_version += 1
+            self._mark_dirty()
             return
 
-        # Align CURRENT -> PREVIOUS
+        # Odometry: CURRENT -> PREVIOUS (fast)
         T_cur_to_prev, fit = icp_transform_backend(pts_k, self.frames[k - 1], self.icp_voxel, np.eye(4))
         T_k = self.poses[-1] @ T_cur_to_prev
         self.poses.append(T_k)
         self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(T_k.copy()))
         info = np.identity(6) * max(100.0 * fit, 10.0)
         self.pose_graph.edges.append(
-            o3d.pipelines.registration.PoseGraphEdge(
-                k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=False
-            )
+            o3d.pipelines.registration.PoseGraphEdge(k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=False)
         )
 
-        # Loop closure (scan-context) with stride
+        # Loop closure (coarse)
         self.descs.append(make_scan_context(pts_k))
         if self.enable_loop and self.loop_on and k > self.loop_gap:
             best_j, best_d = -1, 1e9
@@ -379,11 +405,10 @@ class SimpleSLAM(threading.Thread):
                 T_cur_to_j, fit_loop = icp_transform_backend(pts_k, self.frames[best_j], self.icp_voxel, init)
                 info_l = np.identity(6) * max(50.0 * fit_loop, 10.0)
                 self.pose_graph.edges.append(
-                    o3d.pipelines.registration.PoseGraphEdge(
-                        best_j, k, np.linalg.inv(T_cur_to_j), info_l, uncertain=True
-                    )
+                    o3d.pipelines.registration.PoseGraphEdge(best_j, k, np.linalg.inv(T_cur_to_j), info_l, uncertain=True)
                 )
 
+        # Occasional global optimization (lazy)
         did_opt = False
         if k % self.optimize_every == 0 and k > 0:
             option = o3d.pipelines.registration.GlobalOptimizationOption(
@@ -401,24 +426,27 @@ class SimpleSLAM(threading.Thread):
             self.poses = [n.pose.copy() for n in self.pose_graph.nodes]
             did_opt = True
 
+        # Update map incrementally (no arrays here)
         if did_opt and self.rebuild_after_opt:
-            self.rebuild_map(k)
+            # Reinsert all frames up to k (still lighter than old version due to no array build)
+            self.map.clear()
+            for i in range(0, k + 1):
+                self.map.insert(self.frames[i], self.poses[i])
+            self._mark_dirty()
         else:
             self.map.insert(pts_k, self.poses[-1])
-            with self.lock:
-                self.latest_map = self.map.to_points()
-                self.map_version += 1
+            self._mark_dirty()
+
+        # Optional sliding window
+        self._maintain_window(k)
 
 # --------- Camera helpers ---------
 def fit_camera(renderer, margin=2.4):
-    if renderer is None:
-        return
+    if renderer is None: return
     renderer.ResetCamera()
     cam = renderer.GetActiveCamera()
-    try:
-        cam.Zoom(1.0 / float(margin))
-    except Exception:
-        pass
+    try: cam.Zoom(1.0 / float(margin))
+    except Exception: pass
     renderer.ResetCameraClippingRange()
 
 _first_fit_done = {"left": False, "right": False}
@@ -438,7 +466,6 @@ def extract_pose_vectors(T: np.ndarray):
         return v / n if n > 1e-9 else v
     return p, norm(fwd), norm(left), norm(up)
 
-# Cache last known pose for persistent marker
 _last_pose = {"T": np.eye(4, dtype=np.float32)}
 
 # --------- App ---------
@@ -454,31 +481,27 @@ def build_app(seq_dir: str, fps: int = 10):
         pts = load_frame(idx)
         pts = crop_distance(pts, float(min_d), float(max_d))
         if voxel and float(voxel) > 0:
-            pts = voxel_downsample(pts, float(voxel))  # keep CPU here to preserve intensity
+            pts = voxel_downsample(pts, float(voxel))
         return pts
 
     server = get_server(client_type="vue2")
     state, ctrl = server.state, server.controller
 
-    # ----- Render window (reliable setup for web remote view) -----
+    # ----- Render window -----
     rw = vtk.vtkRenderWindow()
-    # Multi-layer is needed for overlay marker
     try: rw.SetNumberOfLayers(2)
     except Exception: pass
-    # Offscreen: leave OFF on Windows; ON elsewhere is fine for server-side rendering
     if IS_WINDOWS:
         try: rw.SetOffScreenRendering(0)
         except Exception: pass
     else:
         try: rw.SetOffScreenRendering(1)
         except Exception: pass
-    # Avoid hiding anything
     try: rw.SetMultiSamples(0)
     except Exception: pass
     try: rw.SetAlphaBitPlanes(0)
     except Exception: pass
 
-    # Two main renderers + one overlay for marker (on right view)
     ren_left  = vtk.vtkRenderer(); ren_left.SetBackground(0.07, 0.07, 0.10)
     ren_right = vtk.vtkRenderer(); ren_right.SetBackground(0.05, 0.05, 0.08)
     ren_marker = vtk.vtkRenderer()
@@ -487,29 +510,21 @@ def build_app(seq_dir: str, fps: int = 10):
     try: ren_marker.SetBackgroundAlpha(0.0)
     except Exception: pass
 
-    rw.AddRenderer(ren_left)
-    rw.AddRenderer(ren_right)
-    rw.AddRenderer(ren_marker)
-
-    # Initial layout (split)
+    rw.AddRenderer(ren_left); rw.AddRenderer(ren_right); rw.AddRenderer(ren_marker)
     ren_left.SetViewport(0.0, 0.0, 0.5, 1.0)
     ren_right.SetViewport(0.5, 0.0, 1.0, 1.0)
-    ren_marker.SetViewport(ren_right.GetViewport())
-    ren_marker.SetActiveCamera(ren_right.GetActiveCamera())
+    ren_marker.SetViewport(ren_right.GetViewport()); ren_marker.SetActiveCamera(ren_right.GetActiveCamera())
 
-    # Interactor
     iren = vtk.vtkRenderWindowInteractor(); iren.SetRenderWindow(rw)
     try: iren.EnableRenderOff()
     except Exception: pass
     style_trackball = vtk.vtkInteractorStyleTrackballCamera()
-    style_image     = vtk.vtkInteractorStyleImage()   # left-drag pan
-    iren.SetInteractorStyle(style_image)              # Pan Mode default ON
+    style_image     = vtk.vtkInteractorStyleImage()
+    iren.SetInteractorStyle(style_image)
 
     def apply_interactor_style():
-        if bool(state.pan_mode):
-            iren.SetInteractorStyle(style_image)      # left-drag pans
-        else:
-            iren.SetInteractorStyle(style_trackball)  # left-drag rotates (Shift+Left pan)
+        if bool(state.pan_mode): iren.SetInteractorStyle(style_image)
+        else: iren.SetInteractorStyle(style_trackball)
         try: iren.Initialize()
         except Exception: pass
         ctrl.view_update()
@@ -527,32 +542,19 @@ def build_app(seq_dir: str, fps: int = 10):
     scan_prop = scan_actor.GetProperty(); scan_prop.SetRenderPointsAsSpheres(1)
     ren_left.AddActor(scan_actor)
 
-    # ---- Pose marker (overlay) ----
-    marker_src = vtk.vtkConeSource()
-    marker_src.SetRadius(0.8)       # slightly bigger for visibility
-    marker_src.SetHeight(2.4)
-    marker_src.SetDirection(1, 0, 0)
-    marker_src.SetResolution(32)
-
-    marker_mapper = vtk.vtkPolyDataMapper()
-    marker_mapper.SetInputConnection(marker_src.GetOutputPort())
-
-    marker_actor = vtk.vtkActor()
-    marker_actor.SetMapper(marker_mapper)
-    marker_actor.SetPickable(False)
-    marker_actor.SetVisibility(False)
-    mp = marker_actor.GetProperty()
-    mp.SetColor(1.0, 0.2, 0.2)
-    mp.SetLighting(False)
-    try: mp.SetDepthTestOff()   # always on top
+    # Pose marker (overlay)
+    marker_src = vtk.vtkConeSource(); marker_src.SetRadius(0.8); marker_src.SetHeight(2.4); marker_src.SetDirection(1, 0, 0); marker_src.SetResolution(32)
+    marker_mapper = vtk.vtkPolyDataMapper(); marker_mapper.SetInputConnection(marker_src.GetOutputPort())
+    marker_actor = vtk.vtkActor(); marker_actor.SetMapper(marker_mapper); marker_actor.SetPickable(False); marker_actor.SetVisibility(False)
+    mp = marker_actor.GetProperty(); mp.SetColor(1.0, 0.2, 0.2); mp.SetLighting(False)
+    try: mp.SetDepthTestOff()
     except Exception: pass
     ren_marker.AddActor(marker_actor)
 
-    # Start with valid cameras
     ren_left.ResetCamera(); ren_right.ResetCamera()
 
-    # ---------- State (requested defaults) ----------
-    state.trame__title = "KITTI LiDAR SLAM (CPU⇄GPU ICP; Split View; Publish Caps)"
+    # ---------- State (RT defaults) ----------
+    state.trame__title = "KITTI LiDAR SLAM (RT-optimized)"
     state.seq_dir = str(Path(seq_dir).resolve())
     state.frame = 0
     state.n_frames = len(files); state.max_frame = max(0, state.n_frames - 1)
@@ -575,14 +577,12 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # layout & interaction
     state.split_view = True
-    state.map_only_on_build = False   # safer default so you always see something
+    state.map_only_on_build = False
     state.pan_mode = True
 
-    # camera follow (right/map)
+    # camera follow
     state.follow_pose = False
-    state.cam_back = 30.0
-    state.cam_up   = 15.0
-    state.cam_side = 0.0
+    state.cam_back = 30.0; state.cam_up = 15.0; state.cam_side = 0.0
 
     # Pose marker
     state.show_pose_marker = True
@@ -594,30 +594,36 @@ def build_app(seq_dir: str, fps: int = 10):
     # playback
     state.play = False; state.fps = int(fps)
 
-    # SLAM controls
+    # SLAM controls (RT-friendly)
     state.slam_on = True
     state.loop_on = True
-    state.icp_voxel = 0.4; state.ds_voxel = 0.2; state.map_voxel = 0.3
-    state.loop_gap = 30; state.loop_thresh = 0.25; state.optimize_every = 30
-    state.loop_stride = 1
-    state.rebuild_after_opt = True
+    state.icp_voxel = 0.8; state.ds_voxel = 0.35; state.map_voxel = 0.45
+    state.loop_gap = 90; state.loop_thresh = 0.35; state.optimize_every = 200
+    state.loop_stride = 6
+    state.rebuild_after_opt = False
+    state.window_horizon = 0          # 0=off; e.g., 300 keeps last 30s at 10Hz
 
     # progress
     state.map_building = False; state.map_progress = 0.0
 
     # Map publish performance caps
-    state.max_publish_points = 600000
-    state.map_publish_every_n = 3
+    state.max_publish_points = 300_000
+    state.map_publish_every_n = 8
 
     # CPU⇄GPU toggle
     state.use_gpu = bool(HAVE_CUPOCH)
+    # --- cadence / throttling ---
+    state.ui_publish_stride = 10     # update visualization every N frames (5–10 is good)
 
+    _iw_cache = {"lo": 0.0, "hi": 1.0}
+    _last_viz_frame = {"f": -1}
     last_map_version = {"v": -1}
     last_published_version = {"v": -1}
     pushing = {"v": False}
     last_fast = {"v": False}
     _last_push = {"t": 0.0}
-    MIN_PUSH_DT = 1.0 / 12.0  # cap pushes to ~12 fps
+    MIN_PUSH_DT_IDLE = 1.0 / 10.0      # at most ~8 fps when idle
+    MIN_PUSH_DT_INTER = 1.0 / 5.0     # at most ~4 fps while interacting (scroll/zoom)
 
     # Prefetch
     PREFETCH = 24
@@ -626,7 +632,7 @@ def build_app(seq_dir: str, fps: int = 10):
         end = min(idx + 1 + PREFETCH, state.n_frames)
         for j in range(idx + 1, end): pool.submit(load_frame, j)
 
-    # ---- disable alpha/peeling (robust for splats & remote view) ----
+    # ---- alpha/peeling off ----
     def configure_alpha_features(render_window, renderers):
         try: render_window.SetMultiSamples(0)
         except Exception: pass
@@ -637,9 +643,7 @@ def build_app(seq_dir: str, fps: int = 10):
                 r.SetUseDepthPeeling(0)
                 r.SetMaximumNumberOfPeels(0)
                 r.SetOcclusionRatio(0.0)
-            except Exception:
-                pass
-
+            except Exception: pass
     configure_alpha_features(rw, (ren_left, ren_right, ren_marker))
 
     # SLAM worker
@@ -653,7 +657,7 @@ def build_app(seq_dir: str, fps: int = 10):
             loop_gap=int(state.loop_gap), loop_thresh=float(state.loop_thresh),
             optimize_every=int(state.optimize_every),
             enable_loop=bool(state.loop_on), rebuild_after_opt=bool(state.rebuild_after_opt),
-            loop_stride=int(state.loop_stride),
+            loop_stride=int(state.loop_stride), window_horizon=int(state.window_horizon),
         )
         s.min_d = float(state.min_d); s.max_d = float(state.max_d)
         s.ds_voxel = float(state.ds_voxel); s.loop_on = bool(state.loop_on)
@@ -661,7 +665,8 @@ def build_app(seq_dir: str, fps: int = 10):
 
     def push_view():
         now = time.perf_counter()
-        if pushing["v"] or (now - _last_push["t"] < MIN_PUSH_DT):
+        min_dt = MIN_PUSH_DT_INTER if bool(state.interacting) else MIN_PUSH_DT_IDLE
+        if pushing["v"] or (now - _last_push["t"] < min_dt):
             return
         pushing["v"] = True
         try:
@@ -678,57 +683,74 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # ---- GPU splats self-test ----
     def gpu_splats_self_test(poly_for_test=None) -> bool:
+        """
+        Verify PointGaussianMapper works on this driver, without permanently
+        hijacking the mappers' inputs. We save/restore the previous inputs.
+        """
+        # Capture current inputs to restore after test
+        prev_map_input = map_mapper_fast.GetInput()
+        prev_scan_input = scan_mapper_fast.GetInput()
         try:
             if poly_for_test is None:
-                test = np.array([[0,0,0,1],[1,0,0,1],[0,1,0,1]], np.float32)
+                test = np.array([[0, 0, 0, 1],
+                                [1, 0, 0, 1],
+                                [0, 1, 0, 1]], np.float32)
                 poly_for_test = np_points_to_polydata(test, state.color_mode, (0.0, 1.0))
             map_mapper_fast.SetInputData(poly_for_test)
             scan_mapper_fast.SetInputData(poly_for_test)
+
             rw.Render()
             w2i = vtk.vtkWindowToImageFilter()
             w2i.SetInput(rw)
             w2i.ReadFrontBufferOff()
             w2i.Update()
             img = vtk_to_numpy(w2i.GetOutput().GetPointData().GetScalars())
-            return bool(img is not None and img.size and img.max() > 0)
+            ok = bool(img is not None and img.size and img.max() > 0)
+            return ok
         except Exception:
             return False
+        finally:
+            # Always restore the original inputs
+            if prev_map_input is not None:
+                map_mapper_fast.SetInputData(prev_map_input)
+            if prev_scan_input is not None:
+                scan_mapper_fast.SetInputData(prev_scan_input)
 
-    # ---- Mapper swapping (robust) ----
+    # ---- Mapper swapping ----
     def swap_map_mapper():
         want_fast = bool(state.use_fast_mapper)
         is_fast   = isinstance(map_actor.GetMapper(), vtk.vtkPointGaussianMapper)
         if want_fast and not is_fast:
-            map_actor.SetMapper(map_mapper_fast)
-            map_actor.GetProperty().SetOpacity(1.0)
+            map_actor.SetMapper(map_mapper_fast); map_actor.GetProperty().SetOpacity(1.0)
             map_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
             if not gpu_splats_self_test(map_actor.GetMapper().GetInput()):
-                map_actor.SetMapper(map_mapper_std)
-                map_actor.GetProperty().SetOpacity(float(state.map_opacity))
+                map_actor.SetMapper(map_mapper_std); map_actor.GetProperty().SetOpacity(float(state.map_opacity))
                 state.use_fast_mapper = False
         elif not want_fast and is_fast:
-            map_actor.SetMapper(map_mapper_std)
-            map_actor.GetProperty().SetOpacity(float(state.map_opacity))
+            map_actor.SetMapper(map_mapper_std); map_actor.GetProperty().SetOpacity(float(state.map_opacity))
 
     def swap_scan_mapper():
         want_fast = bool(state.use_fast_mapper)
         is_fast   = isinstance(scan_actor.GetMapper(), vtk.vtkPointGaussianMapper)
         if want_fast and not is_fast:
-            scan_actor.SetMapper(scan_mapper_fast)
-            scan_actor.GetProperty().SetOpacity(1.0)
+            scan_actor.SetMapper(scan_mapper_fast); scan_actor.GetProperty().SetOpacity(1.0)
             scan_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
             if not gpu_splats_self_test(scan_actor.GetMapper().GetInput()):
-                scan_actor.SetMapper(scan_mapper_std)
-                scan_actor.GetProperty().SetOpacity(1.0)
+                scan_actor.SetMapper(scan_mapper_std); scan_actor.GetProperty().SetOpacity(1.0)
                 state.use_fast_mapper = False
         elif not want_fast and is_fast:
-            scan_actor.SetMapper(scan_mapper_std)
-            scan_actor.GetProperty().SetOpacity(1.0)
+            scan_actor.SetMapper(scan_mapper_std); scan_actor.GetProperty().SetOpacity(1.0)
 
     def iw_for_render():
+        # If interacting and auto, freeze the last window to avoid percentile work on every pan/zoom
+        if state.auto_intensity and bool(state.interacting):
+            return (_iw_cache["lo"], _iw_cache["hi"])
         if state.auto_intensity:
-            return (1.0, 0.0)  # hi<=lo => auto
+            # returning (1.0, 0.0) triggers auto-windowing inside np_points_to_polydata/publish path,
+            # but we want to cache the result; so leave iw_for_render as a hint and set cache in publish.
+            return (1.0, 0.0)
         return (float(state.i_low), float(state.i_high))
+
 
     def stride_for_map():
         base = max(1, as_int(state.map_stride, 1))
@@ -754,12 +776,10 @@ def build_app(seq_dir: str, fps: int = 10):
         cam.SetViewUp(float(up[0]), float(up[1]), float(up[2]))
         ren_right.ResetCameraClippingRange()
 
-    # ---- Pose marker (persistent, overlay, depth test off) ----
+    # ---- Pose marker ----
     def update_pose_marker():
         if not bool(state.show_pose_marker):
-            marker_actor.SetVisibility(False)
-            return
-
+            marker_actor.SetVisibility(False); return
         T = None
         try:
             if slam is not None:
@@ -770,12 +790,10 @@ def build_app(seq_dir: str, fps: int = 10):
                         T = slam.poses[idx].copy()
         except Exception:
             T = None
-
         if T is None:
             T = _last_pose.get("T")
             if T is None:
-                marker_actor.SetVisibility(False)
-                return
+                marker_actor.SetVisibility(False); return
         else:
             _last_pose["T"] = T
 
@@ -789,13 +807,9 @@ def build_app(seq_dir: str, fps: int = 10):
             cam = ren_right.GetActiveCamera()
             cpos = np.array(cam.GetPosition(), dtype=float)
             dist = max(1.0, float(np.linalg.norm(cpos - p)))
-            s = max(
-                float(as_float(state.marker_size_min, 1.0)),
-                min(
-                    float(as_float(state.marker_size, 2.5)),
-                    float(as_float(state.marker_scale_k, 0.035)) * dist,
-                ),
-            )
+            s = max(float(as_float(state.marker_size_min, 1.0)),
+                    min(float(as_float(state.marker_size, 2.5)),
+                        float(as_float(state.marker_scale_k, 0.035)) * dist))
         marker_actor.SetScale(s, s, s)
         marker_actor.SetVisibility(True)
 
@@ -812,7 +826,73 @@ def build_app(seq_dir: str, fps: int = 10):
         ren_marker.SetViewport(ren_right.GetViewport())
         ren_marker.SetActiveCamera(ren_right.GetActiveCamera())
 
-    # ---- Update functions ----
+    # ---- Persistent polydata for MAP ----
+    map_poly = vtk.vtkPolyData()
+    map_pts  = vtk.vtkPoints()
+    map_rgb  = vtk.vtkUnsignedCharArray(); map_rgb.SetNumberOfComponents(3); map_rgb.SetName("RGB")
+    map_verts = vtk.vtkCellArray()
+    map_poly.SetPoints(map_pts)
+    map_poly.GetPointData().SetScalars(map_rgb)
+    map_poly.SetVerts(map_verts)
+    map_mapper_std.SetInputData(map_poly)
+    map_mapper_fast.SetInputData(map_poly)
+
+    def publish_map_points(pts: np.ndarray):
+        """Update persistent VTK arrays safely (VTK owns its memory)."""
+        n = int(len(pts))
+
+        # --- points (deep copy so VTK owns memory) ---
+        vtk_xyz = numpy_to_vtk(pts[:, :3].astype(np.float32, copy=False), deep=True)
+        map_pts.SetData(vtk_xyz)
+
+        # --- verts (deep copy) ---
+        # Build connectivity [1, id, 1, id, ...]
+        ids = np.arange(n, dtype=np.int64)
+        cells = np.empty((n, 2), dtype=np.int64)
+        cells[:, 0] = 1
+        cells[:, 1] = ids
+        vtk_cells = numpy_to_vtkIdTypeArray(cells.ravel(order="C"), deep=True)
+        map_verts.SetCells(n, vtk_cells)
+
+        # --- colors (deep copy) ---
+        lo, hi = iw_for_render()
+        # after computing lo, hi for colors:
+        _iw_cache["lo"] = float(lo)
+        _iw_cache["hi"] = float(hi)
+
+        if pts.shape[1] > 3:
+            intens = pts[:, 3]
+        else:
+            intens = np.zeros(n, np.float32)
+
+        if hi <= lo:
+            lo = float(np.percentile(intens, 2.0)) if n else 0.0
+            hi = float(np.percentile(intens, 98.0)) if n else 1.0
+            if hi <= lo:
+                hi = lo + 1.0
+
+        t = np.clip((intens - lo) / max(1e-9, (hi - lo)), 0, 1)
+        if state.color_mode == "Turbo":
+            rgb_np = turbo_colormap(t)  # uint8 (n,3)
+        else:
+            g = (t * 255).astype(np.uint8)
+            rgb_np = np.stack([g, g, g], axis=1)
+
+        vtk_rgb = numpy_to_vtk(rgb_np.reshape(-1), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
+        vtk_rgb.SetNumberOfComponents(3)
+        vtk_rgb.SetName("RGB")
+        map_poly.GetPointData().SetScalars(vtk_rgb)
+
+        # --- sizing ---
+        if isinstance(map_actor.GetMapper(), vtk.vtkPointGaussianMapper):
+            map_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
+        else:
+            div = 2 if state.interacting else 1
+            ps_map = max(1, as_int(state.point_size_map))
+            map_actor.GetProperty().SetPointSize(max(1, ps_map // div))
+            map_actor.GetProperty().SetOpacity(float(state.map_opacity))
+
+
     def update_scan_actor(idx: int):
         pts = preprocess_frame(idx, float(state.min_d), float(state.max_d), float(state.ds_voxel))
         if state.use_world_pose and slam is not None:
@@ -822,9 +902,7 @@ def build_app(seq_dir: str, fps: int = 10):
         if s > 1 and len(pts) > 0: pts = pts[::s]
         const = (255, 240, 60) if state.highlight_scan else None
         poly = np_points_to_polydata(pts, state.color_mode, iw_for_render(), constant_rgb=const)
-
-        scan_mapper_std.SetInputData(poly)
-        scan_mapper_fast.SetInputData(poly)
+        scan_mapper_std.SetInputData(poly); scan_mapper_fast.SetInputData(poly)
         if isinstance(scan_actor.GetMapper(), vtk.vtkPointGaussianMapper):
             scan_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
         else:
@@ -832,74 +910,78 @@ def build_app(seq_dir: str, fps: int = 10):
             ps_scan = max(1, as_int(state.point_size_scan))
             scan_prop.SetPointSize(max(1, ps_scan // div))
         swap_scan_mapper()
-
         if len(pts) > 0:
             fit_camera_once(ren_left, side="left", margin=2.2)
 
     def update_map_actor():
         nonlocal slam
         if slam is None: return
+
         with slam.lock:
             ver = slam.map_version
             prog = float(slam.progress)
             running = bool(slam.running)
-            pts = slam.latest_map
+            need_points = slam._map_dirty
+
         state.map_progress = prog; state.map_building = running
 
         # Publish-skipping while building
         if running and last_published_version["v"] >= 0:
-            if (ver - last_published_version["v"]) < max(1, as_int(state.map_publish_every_n, 3)):
+            if (ver - last_published_version["v"]) < max(1, as_int(state.map_publish_every_n, 8)):
                 return
 
         if ver == last_map_version["v"]:
             return
-        last_map_version["v"] = ver
+
+        # Only now do the potentially expensive conversion path
+        with slam.lock:
+            if not need_points:
+                return
+            # Incremental map array update
+            slam.map.ensure_array()
+            slam.map.apply_dirty()
+            pts_full = slam.map.view_points()
+            slam._map_dirty = False
 
         # Cap publish size with adaptive stride
         s = stride_for_map()
-        cap = max(100_000, as_int(state.max_publish_points, 600000))
+        cap = max(150_000, as_int(state.max_publish_points, 300_000))
+        pts = pts_full
         if len(pts) > cap:
             s = max(s, int(math.ceil(len(pts) / cap)))
         if s > 1 and len(pts) > 0:
             pts = pts[::s]
 
-        poly = np_points_to_polydata(pts, state.color_mode, iw_for_render())
-        map_mapper_std.SetInputData(poly)
-        map_mapper_fast.SetInputData(poly)
-        if isinstance(map_actor.GetMapper(), vtk.vtkPointGaussianMapper):
-            map_mapper_fast.SetScaleFactor(max(0.05, as_float(state.splat_size)))
-        else:
-            div = 2 if state.interacting else 1
-            ps_map = max(1, as_int(state.point_size_map))
-            map_actor.GetProperty().SetPointSize(max(1, ps_map // div))
-            map_actor.GetProperty().SetOpacity(float(state.map_opacity))
+        publish_map_points(pts)
         swap_map_mapper()
 
         if len(pts) > 0:
             fit_camera_once(ren_right, side="right", margin=2.4)
 
+        last_map_version["v"] = ver
         last_published_version["v"] = ver
 
-    def update_frame():
+    def update_frame(force=False):
         idx = int(state.frame)
-        if state.show_current: update_scan_actor(idx)
-        update_map_actor()
-        update_camera_follow_right()
-        update_view_layout()
-        update_pose_marker()
 
-        # Validate fast splats on first use
-        if state.use_fast_mapper and not last_fast["v"]:
-            ok = gpu_splats_self_test()
-            if not ok:
-                state.use_fast_mapper = False
-                swap_map_mapper(); swap_scan_mapper()
-                print("[WARN] Fast GPU splats not supported; reverted to standard mapper.")
-            last_fast["v"] = bool(state.use_fast_mapper)
-        elif not state.use_fast_mapper and last_fast["v"]:
-            last_fast["v"] = False
+        # Only publish when due: every ui_publish_stride frames or when interacting==True or on force
+        publish_due = bool(force) or bool(state.interacting) or (
+            idx != _last_viz_frame["f"] and (idx % max(1, as_int(state.ui_publish_stride, 10)) == 0)
+        )
 
-        push_view(); prefetch(idx)
+        if publish_due:
+            _last_viz_frame["f"] = idx
+            if state.show_current:
+                update_scan_actor(idx)
+            update_map_actor()              # map publish is already version-throttled inside
+            update_view_layout()
+            update_pose_marker()
+            update_camera_follow_right()
+            push_view()
+        else:
+            # Light path: follow camera only; no new map/scan uploads, no view push
+            update_camera_follow_right()
+
 
     ctrl.update_frame = update_frame
 
@@ -928,16 +1010,15 @@ def build_app(seq_dir: str, fps: int = 10):
             if int(state.frame) >= built_idx:
                 return
         state.frame = (int(state.frame) + 1) % state.n_frames
-        update_frame()
+        update_frame()   # publishes only when due
 
-    # Fit both views
+
     @ctrl.trigger("fit_view")
     def _fit_view():
         fit_camera(ren_left, margin=2.2)
         fit_camera(ren_right, margin=2.4)
         ctrl.view_update()
 
-    # interaction flag (from JS)
     @ctrl.trigger("set_interacting")
     def _set_interacting(flag=0):
         prev = bool(state.interacting)
@@ -945,7 +1026,6 @@ def build_app(seq_dir: str, fps: int = 10):
         if prev != state.interacting:
             update_frame()
 
-    # CPU⇄GPU toggle handler
     @ctrl.trigger("toggle_gpu")
     def _toggle_gpu():
         global USE_GPU
@@ -953,7 +1033,6 @@ def build_app(seq_dir: str, fps: int = 10):
         USE_GPU = bool(state.use_gpu)
         try: preprocess_frame.cache_clear()
         except Exception: pass
-        # Clean switch for SLAM
         nonlocal slam
         try:
             if slam is not None and slam.is_alive():
@@ -964,7 +1043,6 @@ def build_app(seq_dir: str, fps: int = 10):
             pass
         print(f"[INFO] ICP backend: {'GPU (Cupoch)' if (USE_GPU and HAVE_CUPOCH) else 'CPU (Open3D)'}")
 
-    # SLAM control
     def start_stop_slam():
         nonlocal slam
         if state.slam_on:
@@ -973,22 +1051,23 @@ def build_app(seq_dir: str, fps: int = 10):
         else:
             if slam is not None and slam.is_alive():
                 slam.stop()
-
     ctrl.start_stop_slam = start_stop_slam
 
     def build_full_map():
-        """Start SLAM from scratch; cap publish size; relax optimization cadence."""
+        """Start SLAM from scratch; RT-friendly config."""
         nonlocal slam, last_published_version
-        empty = np_points_to_polydata(np.empty((0, 4), np.float32), state.color_mode, (0.0, 1.0))
-        map_mapper_std.SetInputData(empty); map_mapper_fast.SetInputData(empty)
-        ctrl.view_update()
+        # clear visible map immediately
+        publish_map_points(np.empty((0, 4), np.float32)); ctrl.view_update()
 
         if slam is not None and slam.is_alive():
             slam.stop(); time.sleep(0.05)
         n = len(files)
         state.optimize_every = max(200, n // 3)
-        state.loop_stride    = max(2, state.loop_stride)
-        state.map_voxel      = max(0.35, as_float(state.map_voxel, 0.3))
+        state.loop_stride    = max(4, state.loop_stride)
+        state.map_voxel      = max(0.45, as_float(state.map_voxel, 0.45))
+        state.ds_voxel       = max(0.35, as_float(state.ds_voxel, 0.35))
+        state.icp_voxel      = max(0.8,  as_float(state.icp_voxel, 0.8))
+        state.rebuild_after_opt = False
 
         slam = make_slam()
         state.map_building = True; state.map_progress = 0.0
@@ -997,15 +1076,18 @@ def build_app(seq_dir: str, fps: int = 10):
         _first_fit_done["left"] = False; _first_fit_done["right"] = False
         slam.start()
         update_view_layout(); ctrl.view_update()
-
     ctrl.build_full_map = build_full_map
 
     def force_rebuild():
+        """Rebuild map arrays from current VoxelMap (incremental already in place)."""
         nonlocal slam
         if slam is None: return
-        slam.rebuild_map()
+        with slam.lock:
+            slam.map.ensure_array()
+            slam.map.apply_dirty()
+            slam._map_dirty = True  # force publish
+            slam.map_version += 1
         _refresh_map()
-
     ctrl.force_rebuild = force_rebuild
 
     def reset_map():
@@ -1013,15 +1095,14 @@ def build_app(seq_dir: str, fps: int = 10):
         if slam is not None and slam.is_alive(): slam.stop(); time.sleep(0.05)
         slam = None; last_map_version["v"] = -1; last_published_version["v"] = -1
         _first_fit_done["left"] = False; _first_fit_done["right"] = False
-        empty = np_points_to_polydata(np.empty((0,4), np.float32), state.color_mode, (0.0, 1.0))
-        map_mapper_std.SetInputData(empty); map_mapper_fast.SetInputData(empty)
-        scan_mapper_std.SetInputData(empty); scan_mapper_fast.SetInputData(empty)
+        publish_map_points(np.empty((0, 4), np.float32))
+        scan_mapper_std.SetInputData(np_points_to_polydata(np.empty((0,4), np.float32), state.color_mode, (0.0,1.0)))
+        scan_mapper_fast.SetInputData(scan_mapper_std.GetInput())
         map_actor.SetMapper(map_mapper_std); scan_actor.SetMapper(scan_mapper_std)
         marker_actor.SetVisibility(False)
         state.map_progress = 0.0; state.map_building = False
         update_view_layout()
         ctrl.view_update()
-
     ctrl.reset_map = reset_map
 
     def _on_client_exited(client_id=None, **_): state.play = False
@@ -1030,7 +1111,7 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # ---------- UI ----------
     with SinglePageLayout(server) as layout:
-        layout.title.set_text("KITTI LiDAR SLAM (CPU⇄GPU ICP; Split View; Publish Caps)")
+        layout.title.set_text("KITTI LiDAR SLAM (RT-optimized)")
         with layout.content:
             with h.Div(style="display:flex; gap:12px; align-items:flex-start; padding:12px;"):
                 with h.Div(style="width:640px; min-width:320px;"):
@@ -1059,7 +1140,6 @@ def build_app(seq_dir: str, fps: int = 10):
                         h.Input(type="checkbox", v_model=("split_view", True), change=ctrl.update_frame); h.Label("Split view (Scan | Map)")
                     with h.Div(style="display:flex; gap:10px; align-items:center;"):
                         h.Input(type="checkbox", v_model=("map_only_on_build", False), change=ctrl.update_frame); h.Label("Map-only during Build Full Map")
-
                     with h.Div(style="display:flex; gap:10px; align-items:center; margin-top:6px;"):
                         h.Input(type="checkbox", v_model=("pan_mode", True), change=ctrl.apply_interactor_style); h.Label("Pan Mode (left-drag pans)")
 
@@ -1112,7 +1192,7 @@ def build_app(seq_dir: str, fps: int = 10):
                         h.Input(type="number", step="1", v_model=("min_d", 0.0), change=ctrl.update_frame, style="width:50%")
                         h.Input(type="number", step="1", v_model=("max_d", 0.0), change=ctrl.update_frame, style="width:50%")
                     h.Label("Downsample voxel (m) for current scan & SLAM (CPU)")
-                    h.Input(type="range", min=0, max=0.8, step=0.02, v_model=("ds_voxel", 0.2), change=ctrl.update_frame, style="width:100%")
+                    h.Input(type="range", min=0, max=0.8, step=0.02, v_model=("ds_voxel", 0.35), change=ctrl.update_frame, style="width:100%")
 
                     h.Hr()
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
@@ -1124,20 +1204,22 @@ def build_app(seq_dir: str, fps: int = 10):
                         h.Input(type="checkbox", v_model=("slam_on", True), change=ctrl.start_stop_slam); h.Label("Run SLAM (live)")
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
                         h.Input(type="checkbox", v_model=("loop_on", True)); h.Label("Loop closure enabled")
-                    h.Label("Loop gap"); h.Input(type="number", min=10, step=1, v_model=("loop_gap", 30))
-                    h.Label("Loop threshold"); h.Input(type="number", step="0.01", v_model=("loop_thresh", 0.25))
-                    h.Label("Optimize every N frames"); h.Input(type="number", min=5, step=1, v_model=("optimize_every", 30))
-                    h.Label("Loop stride (candidate step)"); h.Input(type="number", min=1, step=1, v_model=("loop_stride", 1))
-                    h.Label("Map voxel (m)"); h.Input(type="range", min=0.05, max=1.0, step=0.05, v_model=("map_voxel", 0.3))
-                    h.Label("ICP voxel (m)"); h.Input(type="range", min=0.1, max=1.0, step=0.05, v_model=("icp_voxel", 0.4))
+                    h.Label("Loop gap"); h.Input(type="number", min=10, step=1, v_model=("loop_gap", 90))
+                    h.Label("Loop threshold"); h.Input(type="number", step="0.01", v_model=("loop_thresh", 0.35))
+                    h.Label("Optimize every N frames"); h.Input(type="number", min=5, step=1, v_model=("optimize_every", 200))
+                    h.Label("Loop stride (candidate step)"); h.Input(type="number", min=1, step=1, v_model=("loop_stride", 6))
+                    h.Label("Map voxel (m)"); h.Input(type="range", min=0.05, max=1.0, step=0.05, v_model=("map_voxel", 0.45))
+                    h.Label("ICP voxel (m)"); h.Input(type="range", min=0.1, max=1.5, step=0.05, v_model=("icp_voxel", 0.8))
                     with h.Div(style="display:flex; gap:8px; align_items:center;"):
-                        h.Input(type="checkbox", v_model=("rebuild_after_opt", True)); h.Label("Rebuild map after optimization")
+                        h.Input(type="checkbox", v_model=("rebuild_after_opt", False)); h.Label("Rebuild map after optimization")
+                    with h.Div(style="display:flex; gap:8px; align_items:center; margin-top:6px;"):
+                        h.Label("Sliding window H (frames, 0=off)"); h.Input(type="number", min=0, step=10, v_model=("window_horizon", 0))
 
                     h.Hr()
-                    h.Label("Map publish caps (for performance)")
+                    h.Label("Map publish caps")
                     with h.Div(style="display:flex; gap:8px; align-items:center;"):
-                        h.Label("Max points to publish"); h.Input(type="number", min=100000, step=50000, v_model=("max_publish_points", 600000), change=ctrl.update_frame, style="width:40%")
-                        h.Label("Publish every N versions"); h.Input(type="number", min=1, step=1, v_model=("map_publish_every_n", 3), change=ctrl.update_frame, style="width:30%")
+                        h.Label("Max points to publish"); h.Input(type="number", min=100000, step=50000, v_model=("max_publish_points", 300_000), change=ctrl.update_frame, style="width:40%")
+                        h.Label("Publish every N versions"); h.Input(type="number", min=1, step=1, v_model=("map_publish_every_n", 8), change=ctrl.update_frame, style="width:30%")
 
                     with h.Div(style="display:flex; gap:8px; margin-top:8px;"):
                         h.Button("Build Full Map (run to end)", click=ctrl.build_full_map, style="flex:2")
@@ -1146,16 +1228,13 @@ def build_app(seq_dir: str, fps: int = 10):
 
                     with h.Div(style="margin-top:6px; font-size:12px; opacity:0.8;"):
                         h.Div(children=["Map: ", h.Span(children=["{{ (map_progress*100).toFixed(1) }}%"]), "  ", h.Span(children=["{{ map_building ? '(running)' : '' }}"])])
-                        # Pause refresh during interaction; throttle server pushes
                         h.Script("""
                         (function(){
                           const root = document.querySelector('.vtk-wrap');
                           if (!root || window._pauseHooksSet) return;
                           window._pauseHooksSet = true;
-
                           function stopTimer(){ if (window._mapTimer){ clearInterval(window._mapTimer); window._mapTimer = null; } }
-                          function startTimer(){ if (!window._mapTimer){ window._mapTimer = setInterval(()=>{ try{ trigger('refresh_map'); }catch(e){} }, 700); } }
-
+                          function startTimer(){ if (!window._mapTimer){ window._mapTimer = setInterval(()=>{ try{ trigger('refresh_map'); }catch(e){} }, 900); } }
                           let resumeT = null, interT = null;
                           function markInteractingKick(){
                             if (!window._interacting){
@@ -1187,10 +1266,10 @@ def build_app(seq_dir: str, fps: int = 10):
                         classes="vtk-wrap",
                         style="width:100%; height:100%;",
                         interactive_ratio=6,
-                        interactive_quality=30,
+                        interactive_quality=25,
                         still_ratio=1,
                         still_quality=55,
-                        max_image_size=640,
+                        max_image_size=512,
                     ) as view:
                         def _safe_update():
                             try: view.update()
@@ -1199,7 +1278,6 @@ def build_app(seq_dir: str, fps: int = 10):
                         ctrl.update_frame()
                         ctrl.apply_interactor_style()
 
-    # Start SLAM immediately if requested at startup
     if state.slam_on:
         try: ctrl.start_stop_slam()
         except Exception: pass
