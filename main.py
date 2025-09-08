@@ -185,13 +185,21 @@ def make_scan_context(points: np.ndarray, n_ring=20, n_sector=60, max_range=80.0
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
     r = np.sqrt(x*x + y*y)
     a = (np.arctan2(y, x) + np.pi) / (2 * np.pi)
-    ring_idx = np.clip((r / max_range * n_ring).astype(int), 0, n_ring - 1)
-    sector_idx = np.clip((a * n_sector).astype(int), 0, n_sector - 1)
-    sc = np.full((n_ring, n_sector), -np.inf, dtype=np.float32)
-    for i in range(len(z)):
-        ri = ring_idx[i]; si = sector_idx[i]
-        if z[i] > sc[ri, si]: sc[ri, si] = z[i]
-    sc[sc == -np.inf] = 0.0
+    ring_idx = np.clip((r / max_range * n_ring).astype(np.int32), 0, n_ring - 1)
+    sector_idx = np.clip((a * n_sector).astype(np.int32), 0, n_sector - 1)
+
+    sc = np.zeros((n_ring, n_sector), dtype=np.float32)
+    # flatten indices for fast max-by-bin
+    flat_idx = ring_idx * n_sector + sector_idx
+    # For duplicated bins, take max z
+    # Sort by z so latest overwrites; or use bincount-based reduction:
+    order = np.argsort(z)  # ascending, last wins
+    flat_idx = flat_idx[order]; z_sorted = z[order]
+    # write max via take/put – or use maximum.at on a 1D view
+    sc_flat = sc.ravel()
+    np.maximum.at(sc_flat, flat_idx, z_sorted)
+    sc = sc_flat.reshape(n_ring, n_sector)
+    # row-wise normalize
     row_max = sc.max(axis=1, keepdims=True) + 1e-6
     return sc / row_max
 
@@ -307,9 +315,13 @@ class SimpleSLAM(threading.Thread):
     - Does NOT allocate big arrays (no to_points here)
     """
     def __init__(self, files, preprocess_fn,
-                 map_voxel=0.45, icp_voxel=0.8, loop_gap=90, loop_thresh=0.35,
-                 optimize_every=200, enable_loop=True, rebuild_after_opt=False,
-                 loop_stride=6, window_horizon: int = 0):
+             map_voxel=0.45, icp_voxel=0.8, loop_gap=90, loop_thresh=0.35,
+             optimize_every=200, enable_loop=True, rebuild_after_opt=False,
+             loop_stride=6, window_horizon=0,
+             sc_n_ring=20, sc_n_sector=36,
+             kf_dist_m=4.0, kf_yaw_deg=12.0,
+             loop_check_every=10, loop_topk=10,
+             loop_min_icp_fit=0.35, loop_verify="icp"):
         super().__init__(daemon=True)
         self.files = files
         self.preprocess = preprocess_fn
@@ -339,6 +351,24 @@ class SimpleSLAM(threading.Thread):
         # live params
         self.min_d = 0.0; self.max_d = 0.0; self.ds_voxel = 0.35; self.loop_on = True
 
+        # keyframes & loop DB
+        self.kf_indices: list[int] = []
+        self.kf_poses:   list[np.ndarray] = []
+        self.kf_scs:     list[np.ndarray] = []
+        self.kf_rkeys:   list[np.ndarray] = []   # ring keys
+
+        # cache last pose for keyframe gating
+        self._last_kf_pose = np.eye(4, dtype=np.float32)
+
+        self.sc_n_ring = sc_n_ring
+        self.sc_n_sector = sc_n_sector
+        self.kf_dist_m = kf_dist_m
+        self.kf_yaw_deg = kf_yaw_deg
+        self.loop_check_every = loop_check_every
+        self.loop_topk = loop_topk
+        self.loop_min_icp_fit = loop_min_icp_fit
+        self.loop_verify = loop_verify
+
     def run(self):
         self.running = True
         n = len(self.files)
@@ -352,6 +382,67 @@ class SimpleSLAM(threading.Thread):
         self.running = False
 
     def stop(self): self.running = False
+
+    def _needs_keyframe(self, T_k: np.ndarray, dist_m: float, yaw_deg: float) -> bool:
+        p_new = T_k[:3, 3]; p_old = self._last_kf_pose[:3, 3]
+        dp = float(np.linalg.norm(p_new - p_old))
+        if dp >= max(0.1, dist_m):
+            return True
+        # yaw test
+        R_new = T_k[:3, :3]; R_old = self._last_kf_pose[:3, :3]
+        dR = R_old.T @ R_new
+        yaw = float(np.degrees(np.arctan2(dR[1,0], dR[0,0])))
+        return abs(yaw) >= max(1.0, yaw_deg)
+
+    def _loopdb_add(self, k: int, sc: np.ndarray):
+        self.kf_indices.append(k)
+        self.kf_poses.append(self.poses[-1].copy())
+        self.kf_scs.append(sc)
+        self.kf_rkeys.append(sc_ring_key(sc))
+
+    def _loopdb_query_topk(self, sc: np.ndarray, topk: int) -> list[int]:
+        """Brute-force cosine on ring-keys (vectorized) -> indices of top-K keyframes."""
+        if not self.kf_rkeys:
+            return []
+        K = np.asarray(self.kf_rkeys, dtype=np.float32)     # (M, n_sector)
+        q = sc_ring_key(sc).reshape(1, -1)                  # (1, n_sector)
+        num = (K @ q[0])
+        den = np.linalg.norm(K, axis=1) * (np.linalg.norm(q))
+        sim = num / (den + 1e-9)                            # cosine similarity
+        order = np.argsort(-sim)[: min(topk, K.shape[0])]
+        return [self.kf_indices[i] for i in order]
+
+    def _verify_pose(self, pts_k: np.ndarray, pts_j: np.ndarray, init: np.ndarray, method: str) -> Tuple[np.ndarray, float]:
+        """
+        Geometric verification:
+        - 'fgr': Fast Global Registration on strongly downsampled clouds
+        - 'icp': tiny ICP (few iters) as a fallback
+        Returns (T_cur_to_j, fitness)
+        """
+        # light DS for verification
+        def ds(x, v=0.7):  # meters
+            return voxel_downsample(x, v)
+        if method == "fgr":
+            src = o3d.geometry.PointCloud(); src.points = o3d.utility.Vector3dVector(ds(pts_k)[:, :3].astype(np.float64))
+            tgt = o3d.geometry.PointCloud(); tgt.points = o3d.utility.Vector3dVector(ds(pts_j)[:, :3].astype(np.float64))
+            try:
+                o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+            except Exception:
+                pass
+            # FGR parameters
+            option = o3d.pipelines.registration.FastGlobalRegistrationOption(
+                maximum_correspondence_distance=1.5
+            )
+            result = o3d.pipelines.registration.registration_fgr_based_on_correspondence(
+                src, tgt, o3d.utility.Vector2iVector([]), option
+            )
+            # FGR may return identity if it cannot find correspondences; refine with small ICP
+            T0 = np.array(result.transformation, dtype=np.float32) if hasattr(result, "transformation") else init.astype(np.float32)
+            return icp_transform_backend(pts_k, pts_j, voxel=0.8, init=T0)
+        else:
+            # small-iter ICP only
+            return icp_transform_backend(pts_k, pts_j, voxel=0.8, init=init)
+
 
     def _mark_dirty(self):
         with self.lock:
@@ -391,22 +482,44 @@ class SimpleSLAM(threading.Thread):
             o3d.pipelines.registration.PoseGraphEdge(k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=False)
         )
 
-        # Loop closure (coarse)
-        self.descs.append(make_scan_context(pts_k))
-        if self.enable_loop and self.loop_on and k > self.loop_gap:
-            best_j, best_d = -1, 1e9
-            sc_k = self.descs[k]
-            step = max(1, int(self.loop_stride))
-            for j in range(0, k - self.loop_gap, step):
-                d = scan_context_distance(sc_k, self.descs[j])
-                if d < best_d: best_d, best_j = d, j
-            if best_d < self.loop_thresh and best_j >= 0:
-                init = np.linalg.inv(self.poses[best_j]) @ self.poses[k]
-                T_cur_to_j, fit_loop = icp_transform_backend(pts_k, self.frames[best_j], self.icp_voxel, init)
-                info_l = np.identity(6) * max(50.0 * fit_loop, 10.0)
-                self.pose_graph.edges.append(
-                    o3d.pipelines.registration.PoseGraphEdge(best_j, k, np.linalg.inv(T_cur_to_j), info_l, uncertain=True)
-                )
+        # ---- Keyframe (build descriptor DB sparsely) ----
+        sc_k = make_scan_context(pts_k, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
+        is_kf = self._needs_keyframe(T_k, float(self.kf_dist_m), float(self.kf_yaw_deg)) if k > 0 else True
+        if is_kf:
+            self._loopdb_add(k, sc_k)
+            self._last_kf_pose = T_k.copy()
+
+        # ---- Loop-closure (bounded, accurate) ----
+        if self.enable_loop and self.loop_on and k > self.loop_gap and (k % int(self.loop_check_every) == 0) and is_kf and len(self.kf_indices) > 1:
+            cand = self._loopdb_query_topk(sc_k, int(self.loop_topk))
+            best = (None, 1e9, 0)
+            for j in cand:
+                # skip near neighbors (odometry edges already connect them)
+                if (k - j) < self.loop_gap:
+                    continue
+                sc_j = self.kf_scs[self.kf_indices.index(j)]
+                shift, dist = sc_best_shift_fft(sc_k, sc_j)
+                if dist < best[1]:
+                    best = (j, dist, shift)
+
+            j, dist, shift = best
+            if j is not None and dist < float(self.loop_thresh):
+                # Yaw prior from sector shift
+                yaw = 2.0 * np.pi * (shift / float(self.sc_n_sector))
+                # initial guess: align yaw and relative translation from current graph
+                init = (np.linalg.inv(self.poses[j]) @ T_k) @ rotz(yaw).astype(np.float32)
+
+                # Geometric verification (robust)
+                T_cur_to_j, fit_loop = self._verify_pose(pts_k, self.frames[j], init, self.loop_verify)
+
+                if fit_loop >= float(self.loop_min_icp_fit):
+                    info_l = np.identity(6, dtype=np.float32) * max(50.0 * fit_loop, 10.0)
+                    self.pose_graph.edges.append(
+                        o3d.pipelines.registration.PoseGraphEdge(
+                            j, k, np.linalg.inv(T_cur_to_j), info_l, uncertain=True
+                        )
+                    )
+
 
         # Occasional global optimization (lazy)
         did_opt = False
@@ -414,7 +527,7 @@ class SimpleSLAM(threading.Thread):
             option = o3d.pipelines.registration.GlobalOptimizationOption(
                 max_correspondence_distance=max(2.0 * self.icp_voxel, 1.0),
                 edge_prune_threshold=0.25,
-                preference_loop_closure=1.0,
+                preference_loop_closure=2.0,   # was 1.0; give loops more pull
                 reference_node=0,
             )
             o3d.pipelines.registration.global_optimization(
@@ -467,6 +580,29 @@ def extract_pose_vectors(T: np.ndarray):
     return p, norm(fwd), norm(left), norm(up)
 
 _last_pose = {"T": np.eye(4, dtype=np.float32)}
+
+def sc_ring_key(sc: np.ndarray) -> np.ndarray:
+    # 1D signature used for ANN; max across rings is robust
+    return sc.max(axis=0).astype(np.float32, copy=False)
+
+def sc_best_shift_fft(sc1: np.ndarray, sc2: np.ndarray) -> Tuple[int, float]:
+    """Return (best_shift, sc_distance) using FFT circular correlation."""
+    a = sc1.mean(axis=0).astype(np.float32, copy=False)
+    b = sc2.mean(axis=0).astype(np.float32, copy=False)
+    fa = np.fft.rfft(a); fb = np.fft.rfft(b)
+    xcorr = np.fft.irfft(fa * np.conjugate(fb), n=a.size)
+    shift = int(np.argmax(xcorr))
+    b2 = np.roll(sc2, shift, axis=1)
+    num = (sc1 * b2).sum(axis=1)
+    den = np.linalg.norm(sc1, axis=1) * np.linalg.norm(b2, axis=1) + 1e-9
+    dist = 1.0 - float((num / den).mean())
+    return shift, dist
+
+def rotz(theta: float) -> np.ndarray:
+    c, s = np.cos(theta), np.sin(theta)
+    R = np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float32)
+    T = np.eye(4, dtype=np.float32); T[:3,:3] = R
+    return T
 
 # --------- App ---------
 def build_app(seq_dir: str, fps: int = 10):
@@ -598,7 +734,7 @@ def build_app(seq_dir: str, fps: int = 10):
     state.slam_on = True
     state.loop_on = True
     state.icp_voxel = 0.8; state.ds_voxel = 0.35; state.map_voxel = 0.45
-    state.loop_gap = 90; state.loop_thresh = 0.35; state.optimize_every = 200
+    state.loop_gap = 90; state.loop_thresh = 0.35; state.optimize_every = 1000
     state.loop_stride = 6
     state.rebuild_after_opt = False
     state.window_horizon = 0          # 0=off; e.g., 300 keeps last 30s at 10Hz
@@ -614,6 +750,17 @@ def build_app(seq_dir: str, fps: int = 10):
     state.use_gpu = bool(HAVE_CUPOCH)
     # --- cadence / throttling ---
     state.ui_publish_stride = 10     # update visualization every N frames (5–10 is good)
+
+    # --- Loop-closure (accurate & bounded) ---
+    state.sc_n_ring = 20
+    state.sc_n_sector = 36          # fewer sectors -> faster & robust; works well with FFT
+    state.kf_dist_m = 4.0           # create a keyframe every ~4 m traveled
+    state.kf_yaw_deg = 12.0         # or if yaw changed by >= 12 deg
+    state.loop_check_every = 10     # attempt loop closure every N frames
+    state.loop_topk = 10            # candidates fetched from ring-key index
+    state.loop_thresh = 0.32        # SC distance after best shift (0.3-0.35 typical)
+    state.loop_min_icp_fit = 0.35   # reject if geometric verify is weak
+    state.loop_verify = "fgr"       # 'fgr' or 'icp'
 
     _iw_cache = {"lo": 0.0, "hi": 1.0}
     _last_viz_frame = {"f": -1}
@@ -652,13 +799,27 @@ def build_app(seq_dir: str, fps: int = 10):
         def pp(idx, min_d, max_d, voxel):
             return preprocess_frame(idx, float(min_d), float(max_d), float(voxel))
         s = SimpleSLAM(
-            files, preprocess_fn=pp,
-            map_voxel=float(state.map_voxel), icp_voxel=float(state.icp_voxel),
-            loop_gap=int(state.loop_gap), loop_thresh=float(state.loop_thresh),
+            files,
+            preprocess_fn=pp,
+            map_voxel=float(state.map_voxel),
+            icp_voxel=float(state.icp_voxel),
+            loop_gap=int(state.loop_gap),
+            loop_thresh=float(state.loop_thresh),
             optimize_every=int(state.optimize_every),
-            enable_loop=bool(state.loop_on), rebuild_after_opt=bool(state.rebuild_after_opt),
-            loop_stride=int(state.loop_stride), window_horizon=int(state.window_horizon),
+            enable_loop=bool(state.loop_on),
+            rebuild_after_opt=bool(state.rebuild_after_opt),
+            loop_stride=int(state.loop_stride),
+            window_horizon=int(state.window_horizon),
+            sc_n_ring=int(state.sc_n_ring),
+            sc_n_sector=int(state.sc_n_sector),
+            kf_dist_m=float(state.kf_dist_m),
+            kf_yaw_deg=float(state.kf_yaw_deg),
+            loop_check_every=int(state.loop_check_every),
+            loop_topk=int(state.loop_topk),
+            loop_min_icp_fit=float(state.loop_min_icp_fit),
+            loop_verify=str(state.loop_verify),
         )
+
         s.min_d = float(state.min_d); s.max_d = float(state.max_d)
         s.ds_voxel = float(state.ds_voxel); s.loop_on = bool(state.loop_on)
         return s
@@ -1062,7 +1223,7 @@ def build_app(seq_dir: str, fps: int = 10):
         if slam is not None and slam.is_alive():
             slam.stop(); time.sleep(0.05)
         n = len(files)
-        state.optimize_every = max(200, n // 3)
+        state.optimize_every = max(1000, n // 3)
         state.loop_stride    = max(4, state.loop_stride)
         state.map_voxel      = max(0.45, as_float(state.map_voxel, 0.45))
         state.ds_voxel       = max(0.35, as_float(state.ds_voxel, 0.35))
