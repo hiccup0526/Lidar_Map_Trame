@@ -369,6 +369,8 @@ class SimpleSLAM(threading.Thread):
         self.loop_min_icp_fit = loop_min_icp_fit
         self.loop_verify = loop_verify
 
+        self._last_log_time = None
+
     def run(self):
         self.running = True
         n = len(self.files)
@@ -474,6 +476,7 @@ class SimpleSLAM(threading.Thread):
 
         # Odometry: CURRENT -> PREVIOUS (fast)
         T_cur_to_prev, fit = icp_transform_backend(pts_k, self.frames[k - 1], self.icp_voxel, np.eye(4))
+        
         T_k = self.poses[-1] @ T_cur_to_prev
         self.poses.append(T_k)
         self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(T_k.copy()))
@@ -520,7 +523,6 @@ class SimpleSLAM(threading.Thread):
                         )
                     )
 
-
         # Occasional global optimization (lazy)
         did_opt = False
         if k % self.optimize_every == 0 and k > 0:
@@ -553,6 +555,18 @@ class SimpleSLAM(threading.Thread):
         # Optional sliding window
         self._maintain_window(k)
 
+        if (k % 500 == 0 and k > 0) or k == 1:
+            now = time.perf_counter()
+            if self._last_log_time is None:
+                # initialize
+                self._last_log_time = now
+            else:
+                dt = now - self._last_log_time
+                fps_block = 500.0 / dt if k >= 500 else 1.0 / dt
+                print(f"[SLAM] Frames {k-499 if k>=500 else 0}–{k}: {dt:.2f} s "
+                    f"({fps_block:.2f} Hz avg)")
+                self._last_log_time = now
+
 # --------- Camera helpers ---------
 def fit_camera(renderer, margin=2.4):
     if renderer is None: return
@@ -582,11 +596,9 @@ def extract_pose_vectors(T: np.ndarray):
 _last_pose = {"T": np.eye(4, dtype=np.float32)}
 
 def sc_ring_key(sc: np.ndarray) -> np.ndarray:
-    # 1D signature used for ANN; max across rings is robust
     return sc.max(axis=0).astype(np.float32, copy=False)
 
-def sc_best_shift_fft(sc1: np.ndarray, sc2: np.ndarray) -> Tuple[int, float]:
-    """Return (best_shift, sc_distance) using FFT circular correlation."""
+def sc_best_shift_fft(sc1: np.ndarray, sc2: np.ndarray) -> tuple[int, float]:
     a = sc1.mean(axis=0).astype(np.float32, copy=False)
     b = sc2.mean(axis=0).astype(np.float32, copy=False)
     fa = np.fft.rfft(a); fb = np.fft.rfft(b)
@@ -600,8 +612,8 @@ def sc_best_shift_fft(sc1: np.ndarray, sc2: np.ndarray) -> Tuple[int, float]:
 
 def rotz(theta: float) -> np.ndarray:
     c, s = np.cos(theta), np.sin(theta)
-    R = np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float32)
-    T = np.eye(4, dtype=np.float32); T[:3,:3] = R
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float32)
     return T
 
 # --------- App ---------
@@ -713,7 +725,7 @@ def build_app(seq_dir: str, fps: int = 10):
 
     # layout & interaction
     state.split_view = True
-    state.map_only_on_build = False
+    state.map_only_on_build = True
     state.pan_mode = True
 
     # camera follow
@@ -733,8 +745,8 @@ def build_app(seq_dir: str, fps: int = 10):
     # SLAM controls (RT-friendly)
     state.slam_on = True
     state.loop_on = True
-    state.icp_voxel = 0.8; state.ds_voxel = 0.35; state.map_voxel = 0.45
-    state.loop_gap = 90; state.loop_thresh = 0.35; state.optimize_every = 1000
+    state.icp_voxel = 0.5; state.ds_voxel = 0.35; state.map_voxel = 0.45
+    state.loop_gap = 90; state.loop_thresh = 0.35; state.optimize_every = 200
     state.loop_stride = 6
     state.rebuild_after_opt = False
     state.window_horizon = 0          # 0=off; e.g., 300 keeps last 30s at 10Hz
@@ -747,16 +759,16 @@ def build_app(seq_dir: str, fps: int = 10):
     state.map_publish_every_n = 8
 
     # CPU⇄GPU toggle
-    state.use_gpu = bool(HAVE_CUPOCH)
+    state.use_gpu = True
     # --- cadence / throttling ---
     state.ui_publish_stride = 10     # update visualization every N frames (5–10 is good)
 
     # --- Loop-closure (accurate & bounded) ---
     state.sc_n_ring = 20
-    state.sc_n_sector = 36          # fewer sectors -> faster & robust; works well with FFT
-    state.kf_dist_m = 4.0           # create a keyframe every ~4 m traveled
+    state.sc_n_sector = 60          # fewer sectors -> faster & robust; works well with FFT
+    state.kf_dist_m = 2.5           # create a keyframe every ~4 m traveled
     state.kf_yaw_deg = 12.0         # or if yaw changed by >= 12 deg
-    state.loop_check_every = 10     # attempt loop closure every N frames
+    state.loop_check_every = 5     # attempt loop closure every N frames
     state.loop_topk = 10            # candidates fetched from ring-key index
     state.loop_thresh = 0.32        # SC distance after best shift (0.3-0.35 typical)
     state.loop_min_icp_fit = 0.35   # reject if geometric verify is weak
