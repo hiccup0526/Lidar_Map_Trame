@@ -35,6 +35,8 @@ from trame.ui.vuetify import SinglePageLayout
 from trame.widgets import vtk as vtkw
 from trame.widgets import html as h
 
+import traceback
+
 IS_WINDOWS = platform.system() == "Windows"
 
 # --------- VTK <-> NumPy helpers ---------
@@ -51,6 +53,18 @@ def as_int(v, default=0):
 def as_float(v, default=0.0):
     try: return float(v)
     except Exception: return default
+
+LOG_LEVEL = 2   # 1 = verbose, 2 = silent
+
+def log(msg, level=1, **kwargs):
+    """
+    Log messages depending on LOG_LEVEL.
+    level=1 → printed if LOG_LEVEL == 1
+    level=2 → printed if LOG_LEVEL == 1 (but suppressed if LOG_LEVEL > 1)
+    """
+    global LOG_LEVEL
+    if LOG_LEVEL <= level:
+        print(msg, **kwargs)
 
 # --------- IO & preprocessing ---------
 def list_kitti_bins(seq_dir: str):
@@ -150,34 +164,117 @@ def np_to_vtk_matrix(T: np.ndarray) -> vtk.vtkMatrix4x4:
 # --------- ICP backend ---------
 USE_GPU = HAVE_CUPOCH
 
+def _o3d_pc_from_np(pts_np: np.ndarray) -> o3d.geometry.PointCloud:
+    pc = o3d.geometry.PointCloud()
+    if pts_np.size:
+        pc.points = o3d.utility.Vector3dVector(pts_np[:, :3].astype(np.float64, copy=False))
+    return pc
+
+def _ensure_normals(pc: o3d.geometry.PointCloud, radius: float, max_nn: int = 60):
+    if len(pc.points) == 0:
+        return pc
+    if not pc.has_normals():
+        pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn))
+        # any fixed point is fine for consistent orientation
+        pc.orient_normals_towards_camera_location(np.array([0.0, 0.0, 0.0]))
+    return pc
+
+def _safe_fpfh(pc: o3d.geometry.PointCloud, voxel: float):
+    """Compute FPFH if possible; otherwise return None instead of throwing."""
+    if len(pc.points) < 15:
+        return None
+    # FPFH requires normals:
+    try:
+        # normal radius ~ 2.5 * voxel; feature radius ~ 5 * voxel (clamped)
+        nr = max(0.5, 2.5 * float(voxel)) if voxel and voxel > 0 else 1.0
+        fr = max(1.0, 5.0 * float(voxel)) if voxel and voxel > 0 else 2.0
+        _ensure_normals(pc, radius=nr, max_nn=64)
+        return o3d.pipelines.registration.compute_fpfh_feature(
+            pc, o3d.geometry.KDTreeSearchParamHybrid(radius=fr, max_nn=100)
+        )
+    except Exception as e:
+        print(f"[ICP ] skip FPFH: {e}")
+        return None
+
 def icp_transform_backend(src_pts_np: np.ndarray, tgt_pts_np: np.ndarray, voxel: float, init=np.eye(4)):
+    # Empty guards
+    if src_pts_np is None or tgt_pts_np is None or len(src_pts_np) == 0 or len(tgt_pts_np) == 0:
+        return np.eye(4, dtype=np.float32), 0.0
+
+    # -------- Try GPU (Cupoch) point-to-point (fast & robust) --------
     if USE_GPU and HAVE_CUPOCH:
-        src = cph.geometry.PointCloud(); src.points = cph.utility.Vector3fVector(src_pts_np[:, :3].astype(np.float32, copy=False))
-        tgt = cph.geometry.PointCloud(); tgt.points = cph.utility.Vector3fVector(tgt_pts_np[:, :3].astype(np.float32, copy=False))
+        try:
+            src = cph.geometry.PointCloud(); src.points = cph.utility.Vector3fVector(src_pts_np[:, :3].astype(np.float32, copy=False))
+            tgt = cph.geometry.PointCloud(); tgt.points = cph.utility.Vector3fVector(tgt_pts_np[:, :3].astype(np.float32, copy=False))
+            if voxel and voxel > 0:
+                src = src.voxel_down_sample(float(voxel)); tgt = tgt.voxel_down_sample(float(voxel))
+            max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
+            result = cph.registration.registration_icp(
+                src, tgt, max_corr, init.astype(np.float32),
+                cph.registration.TransformationEstimationPointToPoint(),
+                cph.registration.ICPConvergenceCriteria(max_iteration=25),
+            )
+            T = np.array(result.transformation, dtype=np.float32)
+            fit = float(getattr(result, "fitness", 1.0))
+            return T, fit
+        except Exception as e:
+            print(f"[ICP ] GPU path failed, falling back to CPU: {e}")
+
+    # -------- CPU multiscale Point-to-Plane (accurate) --------
+    try:
+        base = max(0.3, float(voxel) if voxel and voxel > 0 else 0.4)
+        levels = []
+        for s in (3.0, 1.5, 1.0):
+            v = base * s
+            # light downsample
+            def _ds(x): 
+                if v <= 0: return x
+                return voxel_downsample(x, v)
+            src_ds = _ds(src_pts_np); tgt_ds = _ds(tgt_pts_np)
+            if len(src_ds) == 0 or len(tgt_ds) == 0: 
+                continue
+            levels.append((src_ds, tgt_ds, v))
+        if levels:
+            T = init.astype(np.float64, copy=True)
+            last_fit = 0.0
+            for (src_ds, tgt_ds, v) in levels:
+                src = _o3d_pc_from_np(src_ds)
+                tgt = _o3d_pc_from_np(tgt_ds)
+                # ensure normals for P2L
+                nr = max(0.8, 2.0 * v)
+                _ensure_normals(src, radius=nr, max_nn=60)
+                _ensure_normals(tgt, radius=nr, max_nn=60)
+                max_corr = max(2.5 * v, 0.8)
+                loss = o3d.pipelines.registration.RobustKernel(
+                    o3d.pipelines.registration.RobustKernelType.Huber, 1.0
+                )
+                estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane(loss)
+                criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+                    max_iteration=30 if v > base*1.6 else 50
+                )
+                res = o3d.pipelines.registration.registration_icp(src, tgt, max_corr, T, estimation, criteria)
+                T = res.transformation
+                last_fit = float(res.fitness)
+            return np.array(T, dtype=np.float32), last_fit
+    except Exception as e:
+        print(f"[ICP ] CPU P2L path failed, will try P2P: {e}")
+
+    # -------- CPU point-to-point fallback (never needs normals) --------
+    try:
+        src = _o3d_pc_from_np(src_pts_np)
+        tgt = _o3d_pc_from_np(tgt_pts_np)
         if voxel and voxel > 0:
             src = src.voxel_down_sample(float(voxel)); tgt = tgt.voxel_down_sample(float(voxel))
         max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
-        result = cph.registration.registration_icp(
-            src, tgt, max_corr, init.astype(np.float32),
-            cph.registration.TransformationEstimationPointToPoint(),
-            cph.registration.ICPConvergenceCriteria(max_iteration=25),  # fewer iters for speed
+        res = o3d.pipelines.registration.registration_icp(
+            src, tgt, max_corr, init,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25),
         )
-        T = np.array(result.transformation, dtype=np.float32)
-        fit = float(getattr(result, "fitness", 1.0))
-        return T, fit
-
-    # CPU fallback
-    src = o3d.geometry.PointCloud(); src.points = o3d.utility.Vector3dVector(src_pts_np[:, :3].astype(np.float64, copy=False))
-    tgt = o3d.geometry.PointCloud(); tgt.points = o3d.utility.Vector3dVector(tgt_pts_np[:, :3].astype(np.float64, copy=False))
-    if voxel and voxel > 0:
-        src = src.voxel_down_sample(float(voxel)); tgt = tgt.voxel_down_sample(float(voxel))
-    max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
-    result = o3d.pipelines.registration.registration_icp(
-        src, tgt, max_corr, init,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25),
-    )
-    return np.array(result.transformation, dtype=np.float32), float(result.fitness)
+        return np.array(res.transformation, dtype=np.float32), float(res.fitness)
+    except Exception as e:
+        print(f"[ICP ] CPU P2P also failed, returning identity: {e}")
+        return np.eye(4, dtype=np.float32), 0.0
 
 # --------- Scan-context ---------
 def make_scan_context(points: np.ndarray, n_ring=20, n_sector=60, max_range=80.0) -> np.ndarray:
@@ -307,94 +404,127 @@ class VoxelMap:
         n = len(self._keys)
         return self._arr[:n]
 
-# --------- SimpleSLAM ---------
-class SimpleSLAM(threading.Thread):
-    """
-    Pose graph SLAM with voxel map; SLAM thread is memory-light:
-    - Only inserts into VoxelMap and marks dirty+version
-    - Does NOT allocate big arrays (no to_points here)
-    """
-    def __init__(self, files, preprocess_fn,
-             map_voxel=0.45, icp_voxel=0.8, loop_gap=90, loop_thresh=0.35,
-             optimize_every=200, enable_loop=True, rebuild_after_opt=False,
-             loop_stride=6, window_horizon=0,
-             sc_n_ring=20, sc_n_sector=36,
-             kf_dist_m=4.0, kf_yaw_deg=12.0,
-             loop_check_every=10, loop_topk=10,
-             loop_min_icp_fit=0.35, loop_verify="icp"):
-        super().__init__(daemon=True)
+# --------- PipelineSLAM ---------
+import queue, threading, time
+
+class PipelineSLAM:
+    """Three-stage SLAM pipeline: loader -> odometry/mapping -> loop/global-opt"""
+    def __init__(
+        self,
+        files,
+        preprocess_fn,
+        map_voxel=0.45, icp_voxel=0.8,
+        loop_gap=90, loop_thresh=0.35,
+        optimize_every=200, enable_loop=True,
+        loop_check_every=10, loop_topk=10, loop_min_icp_fit=0.35,
+        sc_n_ring=20, sc_n_sector=60,
+        window_horizon=0,
+        kf_dist_m=2.5, kf_yaw_deg=12.0,
+        max_queue=4,
+    ):
+        # config
         self.files = files
         self.preprocess = preprocess_fn
         self.icp_voxel = float(icp_voxel)
+        self.enable_loop = bool(enable_loop)
         self.loop_gap = int(loop_gap)
         self.loop_thresh = float(loop_thresh)
         self.optimize_every = int(optimize_every)
-        self.enable_loop = bool(enable_loop)
-        self.rebuild_after_opt = bool(rebuild_after_opt)
-        self.loop_stride = max(1, int(loop_stride))
-        self.window_h = int(window_horizon)  # 0 = off
+        self.loop_check_every = int(loop_check_every)
+        self.loop_topk = int(loop_topk)
+        self.loop_min_icp_fit = float(loop_min_icp_fit)
+        self.window_h = int(window_horizon)
 
+        self.sc_n_ring = int(sc_n_ring)
+        self.sc_n_sector = int(sc_n_sector)
+        self.kf_dist_m = float(kf_dist_m)
+        self.kf_yaw_deg = float(kf_yaw_deg)
+
+        # shared state
         self.map = VoxelMap(map_voxel)
         self.pose_graph = o3d.pipelines.registration.PoseGraph()
         self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
         self.poses = [np.eye(4)]
-        self.descs = [None]
-        self.frames: list[np.ndarray] = []  # preprocessed local frames
-
-        self.idx = 0
-        self.running = False
-        self.lock = threading.Lock()
+        self.frames: list[np.ndarray] = []   # local (preprocessed) frames
+        self.descs: list[Optional[np.ndarray]] = [None]
         self.progress = 0.0
-        self.map_version = 0
-        self._map_dirty = False       # <-- only a flag here
 
-        # live params
-        self.min_d = 0.0; self.max_d = 0.0; self.ds_voxel = 0.35; self.loop_on = True
-
-        # keyframes & loop DB
+        # keyframe DB (loop)
         self.kf_indices: list[int] = []
         self.kf_poses:   list[np.ndarray] = []
         self.kf_scs:     list[np.ndarray] = []
-        self.kf_rkeys:   list[np.ndarray] = []   # ring keys
-
-        # cache last pose for keyframe gating
+        self.kf_rkeys:   list[np.ndarray] = []
         self._last_kf_pose = np.eye(4, dtype=np.float32)
 
-        self.sc_n_ring = sc_n_ring
-        self.sc_n_sector = sc_n_sector
-        self.kf_dist_m = kf_dist_m
-        self.kf_yaw_deg = kf_yaw_deg
-        self.loop_check_every = loop_check_every
-        self.loop_topk = loop_topk
-        self.loop_min_icp_fit = loop_min_icp_fit
-        self.loop_verify = loop_verify
+        # concurrency
+        self.q_load = queue.Queue(maxsize=max_queue)
+        self.q_odo  = queue.Queue(maxsize=max_queue)
+        self.stop_ev = threading.Event()
+        self.lock = threading.Lock()
 
-        self._last_log_time = None
+        # map publish handshake
+        self._map_dirty = False
+        self.map_version = 0
 
-    def run(self):
-        self.running = True
-        n = len(self.files)
-        while self.running and self.idx < n:
-            try:
-                self.process_one(self.idx)
-                self.idx += 1
-                self.progress = self.idx / max(1, n - 1)
-            except Exception:
-                self.idx += 1
-        self.running = False
+        # runtime flags
+        self.min_d = 0.0; self.max_d = 0.0; self.ds_voxel = 0.35; self.loop_on = True
 
-    def stop(self): self.running = False
+        # indices
+        self.n = len(files)
+        self.next_load_idx = 0
+        self.last_processed_idx = -1
 
-    def _needs_keyframe(self, T_k: np.ndarray, dist_m: float, yaw_deg: float) -> bool:
+        # logging
+        self._t0 = time.perf_counter()
+        self._last_log_block = -1   # 0.. floor(k/500)
+
+        self.map_lock = threading.Lock() 
+
+        self._icp_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ICP")
+
+    # --------------- life-cycle ---------------
+    def start(self):
+        self.stop_ev.clear()
+        self.t_load = threading.Thread(target=self._worker_loader, daemon=True)
+        self.t_odo  = threading.Thread(target=self._worker_odometry_map, daemon=True)
+        self.t_loop = threading.Thread(target=self._worker_loop_global, daemon=True)
+        self.t_load.start(); self.t_odo.start(); self.t_loop.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        # unblock queues
+        try:
+            self.q_load.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            self.q_odo.put_nowait(None)
+        except Exception:
+            pass
+
+    @property
+    def running(self):  # for UI
+        return not self.stop_ev.is_set() and (self.last_processed_idx + 1 < self.n)
+
+    @property
+    def idx(self):
+        return self.last_processed_idx + 1
+
+    # --------------- helpers ---------------
+    def _mark_dirty(self):
+        self._map_dirty = True
+        self.map_version += 1
+
+    def _needs_keyframe(self, T_k: np.ndarray) -> bool:
+        # distance OR yaw change
         p_new = T_k[:3, 3]; p_old = self._last_kf_pose[:3, 3]
         dp = float(np.linalg.norm(p_new - p_old))
-        if dp >= max(0.1, dist_m):
+        if dp >= max(0.1, self.kf_dist_m):
             return True
-        # yaw test
         R_new = T_k[:3, :3]; R_old = self._last_kf_pose[:3, :3]
         dR = R_old.T @ R_new
         yaw = float(np.degrees(np.arctan2(dR[1,0], dR[0,0])))
-        return abs(yaw) >= max(1.0, yaw_deg)
+        return abs(yaw) >= max(1.0, self.kf_yaw_deg)
 
     def _loopdb_add(self, k: int, sc: np.ndarray):
         self.kf_indices.append(k)
@@ -403,133 +533,289 @@ class SimpleSLAM(threading.Thread):
         self.kf_rkeys.append(sc_ring_key(sc))
 
     def _loopdb_query_topk(self, sc: np.ndarray, topk: int) -> list[int]:
-        """Brute-force cosine on ring-keys (vectorized) -> indices of top-K keyframes."""
         if not self.kf_rkeys:
             return []
-        K = np.asarray(self.kf_rkeys, dtype=np.float32)     # (M, n_sector)
-        q = sc_ring_key(sc).reshape(1, -1)                  # (1, n_sector)
+        K = np.asarray(self.kf_rkeys, dtype=np.float32)
+        q = sc_ring_key(sc).reshape(1, -1)
         num = (K @ q[0])
         den = np.linalg.norm(K, axis=1) * (np.linalg.norm(q))
-        sim = num / (den + 1e-9)                            # cosine similarity
+        sim = num / (den + 1e-9)
         order = np.argsort(-sim)[: min(topk, K.shape[0])]
         return [self.kf_indices[i] for i in order]
+    
+    def icp_with_timeout(
+        self,
+        src_pts_np,
+        tgt_pts_np,
+        voxel,
+        init,
+        timeout=3.0,
+        frame_idx=None,   # optional; for logging only
+    ):
+        """
+        Runs icp_transform_backend in a tiny thread pool with a hard timeout.
+        Accepts both positional and keyword arguments (frame_idx is optional).
+        """
+        def _job():
+            return icp_transform_backend(src_pts_np, tgt_pts_np, voxel, init)
 
-    def _verify_pose(self, pts_k: np.ndarray, pts_j: np.ndarray, init: np.ndarray, method: str) -> Tuple[np.ndarray, float]:
-        """
-        Geometric verification:
-        - 'fgr': Fast Global Registration on strongly downsampled clouds
-        - 'icp': tiny ICP (few iters) as a fallback
-        Returns (T_cur_to_j, fitness)
-        """
-        # light DS for verification
-        def ds(x, v=0.7):  # meters
-            return voxel_downsample(x, v)
-        if method == "fgr":
-            src = o3d.geometry.PointCloud(); src.points = o3d.utility.Vector3dVector(ds(pts_k)[:, :3].astype(np.float64))
-            tgt = o3d.geometry.PointCloud(); tgt.points = o3d.utility.Vector3dVector(ds(pts_j)[:, :3].astype(np.float64))
+        fut = self._icp_pool.submit(_job)
+        try:
+            T, fit = fut.result(timeout=timeout)
+            if frame_idx is not None:
+                log(f"[ICP ] k={frame_idx} ok fit={fit:.3f}")
+            return T, fit
+        except Exception as e:
+            # Ensure the worker is cancelled if still pending
             try:
-                o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+                fut.cancel()
             except Exception:
                 pass
-            # FGR parameters
-            option = o3d.pipelines.registration.FastGlobalRegistrationOption(
-                maximum_correspondence_distance=1.5
-            )
-            result = o3d.pipelines.registration.registration_fgr_based_on_correspondence(
-                src, tgt, o3d.utility.Vector2iVector([]), option
-            )
-            # FGR may return identity if it cannot find correspondences; refine with small ICP
-            T0 = np.array(result.transformation, dtype=np.float32) if hasattr(result, "transformation") else init.astype(np.float32)
-            return icp_transform_backend(pts_k, pts_j, voxel=0.8, init=T0)
-        else:
-            # small-iter ICP only
-            return icp_transform_backend(pts_k, pts_j, voxel=0.8, init=init)
+            if frame_idx is not None:
+                log(f"[ICP ] k={frame_idx} FAIL: {e!r}")
+            raise
 
 
-    def _mark_dirty(self):
-        with self.lock:
-            self._map_dirty = True
-            self.map_version += 1
+    # --------------- workers ---------------
+    def _worker_loader(self):
+        log("[LOAD] start")
+        while not self.stop_ev.is_set() and self.next_load_idx < self.n:
+            k = self.next_load_idx
+            try:
+                log(f"[LOAD] prep frame {k} ...")
+                t0 = time.perf_counter()
+                pts = self.preprocess(k, self.min_d, self.max_d, self.ds_voxel)  # cached
+                dt = time.perf_counter() - t0
 
-    def _maintain_window(self, upto_idx: int):
-        """Optional sliding window: keep last H frames by periodic rebuild on small subsets."""
-        if self.window_h <= 0:
-            return
-        keep_from = max(0, upto_idx - self.window_h)
-        # Periodically (every H//2 frames) rebuild only last H frames
-        if upto_idx > 0 and (upto_idx % max(1, self.window_h // 2) == 0):
-            self.map.clear()
-            for i in range(keep_from, upto_idx + 1):
-                self.map.insert(self.frames[i], self.poses[i])
-            self._mark_dirty()
+                while not self.stop_ev.is_set():
+                    try:
+                        self.q_load.put((k, pts), timeout=0.5)
+                        log(f"[LOAD] pushed frame {k}  pts={len(pts)}  ({dt:.3f}s)", flush=True)
+                        self.next_load_idx += 1
+                        break
+                    except queue.Full:
+                        # Queue is full; do not recompute; just wait/retry
+                        time.sleep(0.01)
 
-    def process_one(self, k: int):
-        pts_k = self.preprocess(k, self.min_d, self.max_d, self.ds_voxel)
-        if k == len(self.frames): self.frames.append(pts_k)
-        else: self.frames[k] = pts_k
+            except Exception as e:
+                print("[LOAD] fatal:", repr(e))
+                import traceback; traceback.print_exc()
+                self.next_load_idx += 1
+                continue
+        try:
+            self.q_load.put(None, timeout=0.5)
+        except Exception:
+            pass
+        log("[LOAD] EOS", flush=True)
 
-        if k == 0:
-            self.descs[0] = make_scan_context(pts_k)
-            self.map.insert(pts_k, np.eye(4))
-            self._mark_dirty()
-            return
-
-        # Odometry: CURRENT -> PREVIOUS (fast)
-        T_cur_to_prev, fit = icp_transform_backend(pts_k, self.frames[k - 1], self.icp_voxel, np.eye(4))
-        
-        T_k = self.poses[-1] @ T_cur_to_prev
-        self.poses.append(T_k)
-        self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(T_k.copy()))
-        info = np.identity(6) * max(100.0 * fit, 10.0)
-        self.pose_graph.edges.append(
-            o3d.pipelines.registration.PoseGraphEdge(k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=False)
-        )
-
-        # ---- Keyframe (build descriptor DB sparsely) ----
-        sc_k = make_scan_context(pts_k, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
-        is_kf = self._needs_keyframe(T_k, float(self.kf_dist_m), float(self.kf_yaw_deg)) if k > 0 else True
-        if is_kf:
-            self._loopdb_add(k, sc_k)
-            self._last_kf_pose = T_k.copy()
-
-        # ---- Loop-closure (bounded, accurate) ----
-        if self.enable_loop and self.loop_on and k > self.loop_gap and (k % int(self.loop_check_every) == 0) and is_kf and len(self.kf_indices) > 1:
-            cand = self._loopdb_query_topk(sc_k, int(self.loop_topk))
-            best = (None, 1e9, 0)
-            for j in cand:
-                # skip near neighbors (odometry edges already connect them)
-                if (k - j) < self.loop_gap:
+    def _worker_odometry_map(self):
+        log("[ODO ] start", flush=True)
+        prev_pts = None
+        try:
+            while not self.stop_ev.is_set():
+                try:
+                    item = self.q_load.get(timeout=0.5)
+                except queue.Empty:
                     continue
-                sc_j = self.kf_scs[self.kf_indices.index(j)]
-                shift, dist = sc_best_shift_fft(sc_k, sc_j)
-                if dist < best[1]:
-                    best = (j, dist, shift)
+                if item is None:
+                    try: self.q_odo.put(None, timeout=0.5)
+                    except Exception: pass
+                    log("[ODO ] EOS", flush=True)
+                    break
 
-            j, dist, shift = best
-            if j is not None and dist < float(self.loop_thresh):
-                # Yaw prior from sector shift
-                yaw = 2.0 * np.pi * (shift / float(self.sc_n_sector))
-                # initial guess: align yaw and relative translation from current graph
-                init = (np.linalg.inv(self.poses[j]) @ T_k) @ rotz(yaw).astype(np.float32)
+                k, pts_k = item
+                log(f"[ODO ] got frame {k}  pts={len(pts_k)}", flush=True)
 
-                # Geometric verification (robust)
-                T_cur_to_j, fit_loop = self._verify_pose(pts_k, self.frames[j], init, self.loop_verify)
+                if k == 0:
+                    sc0 = make_scan_context(pts_k, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
+                    with self.lock:
+                        self.frames.append(pts_k)
+                        self.descs[0] = sc0
+                        self.map.insert(pts_k, np.eye(4))
+                        self._mark_dirty()
+                        self.last_processed_idx = 0
+                        self.progress = 0.0 if self.n <= 1 else (0 / (self.n - 1))
+                    prev_pts = pts_k
+                    try: self.q_odo.put((k, pts_k[::4], np.eye(4, dtype=np.float32), True), timeout=0.5)
+                    except queue.Full: pass
+                    continue
 
-                if fit_loop >= float(self.loop_min_icp_fit):
-                    info_l = np.identity(6, dtype=np.float32) * max(50.0 * fit_loop, 10.0)
-                    self.pose_graph.edges.append(
-                        o3d.pipelines.registration.PoseGraphEdge(
-                            j, k, np.linalg.inv(T_cur_to_j), info_l, uncertain=True
-                        )
+                # ---- normal path (k>0) ----
+                # Guard against empty inputs
+                if pts_k is None or len(pts_k) == 0 or prev_pts is None or len(prev_pts) == 0:
+                    log(f"[ODO ] skip ICP at k={k} (empty cloud)", flush=True)
+                    prev_pts = pts_k
+                    continue
+
+                try:
+                    T_cur_to_prev, fit = self.icp_with_timeout(
+                        pts_k,                               # src_pts_np
+                        prev_pts if prev_pts is not None else pts_k,  # tgt_pts_np
+                        self.icp_voxel,                      # voxel
+                        np.eye(4, dtype=np.float32),         # init
+                        timeout=2.5,                         # seconds
+                        frame_idx=k,                         # for logs (optional)
                     )
+                except Exception as e:
+                    print(f"[ODO ] ICP failed, using identity. err={e!r}")
+                    T_cur_to_prev, fit = (np.eye(4, dtype=np.float32), 0.0)
 
-        # Occasional global optimization (lazy)
-        did_opt = False
-        if k % self.optimize_every == 0 and k > 0:
+                T_k = None
+
+                MIN_ODOM_FIT = 0.10
+                with self.lock:
+                    T_k = self.poses[-1] @ T_cur_to_prev
+                    self.poses.append(T_k)
+                    self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(T_k.copy()))
+
+                    if fit >= MIN_ODOM_FIT:
+                        info = np.identity(6, dtype=np.float32) * max(100.0 * fit, 10.0)
+                        self.pose_graph.edges.append(
+                            o3d.pipelines.registration.PoseGraphEdge(
+                                k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=False
+                            )
+                        )
+                    else:
+                        # Add a very weak edge (or skip entirely) so optimization won’t snap to garbage
+                        info = np.identity(6, dtype=np.float32) * 1e-3
+                        self.pose_graph.edges.append(
+                            o3d.pipelines.registration.PoseGraphEdge(
+                                k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=True
+                            )
+                        )
+
+                    # Map insert only after pose update
+                    self.map.insert(pts_k, T_k)
+                    self._mark_dirty()   # just flips a flag; safe & fast
+
+                sc_k = make_scan_context(pts_k, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
+                if self._needs_keyframe(T_k):
+                    with self.lock:
+                        self._loopdb_add(k, sc_k)
+                        self._last_kf_pose = T_k.copy()
+
+                with self.map_lock:
+                    self.map.insert(pts_k, T_k)
+
+                with self.lock:
+                    self._map_dirty = True
+                    self.map_version += 1
+                    self.last_processed_idx = k
+                    self.progress = k / max(1, self.n - 1)
+                    blk = k // 500
+                    if blk != self._last_log_block and k % 500 == 0:
+                        now = time.perf_counter()
+                        dt = now - self._t0
+                        self._t0 = now
+                        print(f"[PIPE] {k} frames processed (+500) in {dt:.2f}s  | avg {500.0/max(dt,1e-6):.2f} FPS", flush=True)
+                        self._last_log_block = blk
+
+                prev_pts = pts_k
+
+                try: self.q_odo.put((k, pts_k[::4], T_k.astype(np.float32), False), timeout=0.5)
+                except queue.Full: pass
+
+        except Exception as e:
+            import traceback
+            print("[ODO ] fatal:", repr(e), flush=True)
+            traceback.print_exc()
+            # Don’t swallow; exiting is fine so you see the error
+
+    def _worker_loop_global(self):
+        log("[LOOP] start", flush=True)
+        try:
+            while not self.stop_ev.is_set():
+                try:
+                    item = self.q_odo.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                if item is None:
+                    log("[LOOP] EOS", flush=True)
+                    break
+
+                k, pts_k_light, T_k, is_kf = item
+                did_add_loop_edge = False
+
+                # ---------- Bounded loop-closure ----------
+                if (self.enable_loop and self.loop_on and
+                    k > self.loop_gap and
+                    (k % self.loop_check_every == 0) and
+                    len(self.kf_indices) > 1 and
+                    pts_k_light is not None and len(pts_k_light) > 0):
+
+                    sc_k = make_scan_context(
+                        pts_k_light, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector
+                    )
+                    cand = self._loopdb_query_topk(sc_k, self.loop_topk)
+
+                    best = (None, 1e9, 0)  # (j, dist, shift)
+                    for j in cand:
+                        if (k - j) < self.loop_gap:
+                            continue
+                        try:
+                            sc_j = self.kf_scs[self.kf_indices.index(j)]
+                        except ValueError:
+                            continue
+                        shift, dist = sc_best_shift_fft(sc_k, sc_j)
+                        if dist < best[1]:
+                            best = (j, dist, shift)
+
+                    j, dist, shift = best
+                    if j is not None and dist < self.loop_thresh:
+                        yaw = 2.0 * np.pi * (shift / float(self.sc_n_sector))
+
+                        # prepare data for verification (without holding the lock during ICP)
+                        with self.lock:
+                            if (j < len(self.frames) and j < len(self.poses) and
+                                k < len(self.frames) and k < len(self.poses)):
+                                init = (np.linalg.inv(self.poses[j]) @ self.poses[k]) @ rotz(yaw)
+                                pts_j = self.frames[j]
+                            else:
+                                init, pts_j = None, None
+
+                        # geometric verify
+                        if (init is not None and pts_j is not None and
+                            len(pts_j) > 0 and len(pts_k_light) > 0):
+                            T_cur_to_j, fit_loop = icp_transform_backend(
+                                pts_k_light, pts_j, voxel=0.8, init=init
+                            )
+                            if fit_loop >= self.loop_min_icp_fit:
+                                with self.lock:
+                                    info_l = (np.identity(6, dtype=np.float32) *
+                                            max(50.0 * fit_loop, 10.0))
+                                    self.pose_graph.edges.append(
+                                        o3d.pipelines.registration.PoseGraphEdge(
+                                            j, k, np.linalg.inv(T_cur_to_j),
+                                            info_l, uncertain=True
+                                        )
+                                    )
+                                    did_add_loop_edge = True
+
+                # ---------- Decide whether to optimize now ----------
+                # Optimize on cadence (every N) — that’s enough; no duplicate optimize in loop block.
+                if (k % self.optimize_every) == 0 and k > 0:
+                    # Only run if data up to k is actually available
+                    with self.lock:
+                        have_upto = min(self.last_processed_idx,
+                                        len(self.frames) - 1,
+                                        len(self.poses)  - 1)
+                    if k <= have_upto:
+                        self._run_global_opt_and_reintegrate(k)
+                    # else: skip this cycle; odometry hasn’t caught up yet
+
+        except Exception as e:
+            import traceback
+            print("[LOOP] fatal:", repr(e), flush=True)
+            traceback.print_exc()
+
+    def _run_global_opt_and_reintegrate(self, upto_k: int):
+        with self.lock:
+            # --- run global opt ---
             option = o3d.pipelines.registration.GlobalOptimizationOption(
                 max_correspondence_distance=max(2.0 * self.icp_voxel, 1.0),
                 edge_prune_threshold=0.25,
-                preference_loop_closure=2.0,   # was 1.0; give loops more pull
+                preference_loop_closure=2.0,
                 reference_node=0,
             )
             o3d.pipelines.registration.global_optimization(
@@ -538,34 +824,82 @@ class SimpleSLAM(threading.Thread):
                 o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
                 option,
             )
-            self.poses = [n.pose.copy() for n in self.pose_graph.nodes]
-            did_opt = True
 
-        # Update map incrementally (no arrays here)
-        if did_opt and self.rebuild_after_opt:
-            # Reinsert all frames up to k (still lighter than old version due to no array build)
-            self.map.clear()
-            for i in range(0, k + 1):
-                self.map.insert(self.frames[i], self.poses[i])
-            self._mark_dirty()
-        else:
-            self.map.insert(pts_k, self.poses[-1])
-            self._mark_dirty()
+            # --- update poses without truncating the tail ---
+            optimized = [n.pose.copy() for n in self.pose_graph.nodes]
+            if len(optimized) < len(self.poses):
+                # keep the tail poses as-is so we can still render already-inserted frames
+                optimized.extend(self.poses[len(optimized):])
+            self.poses = optimized
 
-        # Optional sliding window
-        self._maintain_window(k)
+            # --- decide reintegration span ---
+            # Build up to what we actually processed, not upto_k
+            built_max = min(
+                self.last_processed_idx,           # last odometry-processed frame
+                len(self.frames) - 1,
+                len(self.poses)  - 1,
+            )
+            if built_max < 0:
+                return
 
-        if (k % 500 == 0 and k > 0) or k == 1:
-            now = time.perf_counter()
-            if self._last_log_time is None:
-                # initialize
-                self._last_log_time = now
+            if self.window_h > 0:
+                start_i = max(0, built_max - self.window_h)
             else:
-                dt = now - self._last_log_time
-                fps_block = 500.0 / dt if k >= 500 else 1.0 / dt
-                print(f"[SLAM] Frames {k-499 if k>=500 else 0}–{k}: {dt:.2f} s "
-                    f"({fps_block:.2f} Hz avg)")
-                self._last_log_time = now
+                start_i = 0  # full map when no sliding window
+
+            # --- rebuild into a fresh VoxelMap, then swap ---
+            new_map = VoxelMap(self.map.voxel)
+            for i in range(start_i, built_max + 1):
+                if i >= len(self.frames) or self.frames[i] is None:
+                    continue
+                pts_i = self.frames[i]
+                Ti    = self.poses[i]
+                if pts_i is not None and len(pts_i) and Ti is not None:
+                    new_map.insert(pts_i, Ti)
+
+            self.map = new_map
+            self._map_dirty = True
+            self.map_version += 1
+
+
+def _slam_is_alive(obj) -> bool:
+    # Works for Thread, Process, or plain classes
+    if obj is None:
+        return False
+    if hasattr(obj, "is_alive"):
+        try:
+            return bool(obj.is_alive())
+        except TypeError:
+            return bool(obj.is_alive)   # some implementations expose a property
+    # Fallback for our pipeline classes
+    return bool(getattr(obj, "running", False))
+
+def _slam_stop(obj):
+    if obj is None:
+        return
+    # Prefer an explicit stop()
+    if hasattr(obj, "stop"):
+        try:
+            obj.stop()
+        except Exception:
+            pass
+    # If it's a Thread/Process, try to join briefly
+    if hasattr(obj, "join"):
+        try:
+            obj.join(timeout=0.2)
+        except Exception:
+            pass
+
+def _slam_start(obj):
+    if obj is None:
+        return
+    if hasattr(obj, "start"):
+        print("[PIPE] starting threads...")
+        obj.start()
+    else:
+        # If your PipelineSLAM uses an internal thread, expose start()
+        # If not, at least set .running = True and kick an internal loop
+        setattr(obj, "running", True)
 
 # --------- Camera helpers ---------
 def fit_camera(renderer, margin=2.4):
@@ -626,10 +960,15 @@ def build_app(seq_dir: str, fps: int = 10):
 
     @lru_cache(maxsize=1024)
     def preprocess_frame(idx: int, min_d: float, max_d: float, voxel: float) -> np.ndarray:
-        pts = load_frame(idx)
+        t0 = time.perf_counter()
+        pts = load_frame(idx)  # may be heavy I/O
+        t1 = time.perf_counter()
         pts = crop_distance(pts, float(min_d), float(max_d))
         if voxel and float(voxel) > 0:
             pts = voxel_downsample(pts, float(voxel))
+        t2 = time.perf_counter()
+        if (idx % 100) == 0 or idx <= 2:  # keep it light
+            log(f"[PP ] i={idx} load={t1-t0:.3f}s crop+ds={t2-t1:.3f}s out={len(pts)}")
         return pts
 
     server = get_server(client_type="vue2")
@@ -805,12 +1144,15 @@ def build_app(seq_dir: str, fps: int = 10):
             except Exception: pass
     configure_alpha_features(rw, (ren_left, ren_right, ren_marker))
 
+    _pre_lock = threading.RLock()
+
     # SLAM worker
-    slam: Optional[SimpleSLAM] = None
-    def make_slam() -> SimpleSLAM:
+    slam: Optional[PipelineSLAM] = None
+    def make_slam() -> PipelineSLAM:
         def pp(idx, min_d, max_d, voxel):
-            return preprocess_frame(idx, float(min_d), float(max_d), float(voxel))
-        s = SimpleSLAM(
+            with _pre_lock:
+                return preprocess_frame(idx, float(min_d), float(max_d), float(voxel))
+        s = PipelineSLAM(
             files,
             preprocess_fn=pp,
             map_voxel=float(state.map_voxel),
@@ -819,19 +1161,15 @@ def build_app(seq_dir: str, fps: int = 10):
             loop_thresh=float(state.loop_thresh),
             optimize_every=int(state.optimize_every),
             enable_loop=bool(state.loop_on),
-            rebuild_after_opt=bool(state.rebuild_after_opt),
-            loop_stride=int(state.loop_stride),
-            window_horizon=int(state.window_horizon),
-            sc_n_ring=int(state.sc_n_ring),
-            sc_n_sector=int(state.sc_n_sector),
-            kf_dist_m=float(state.kf_dist_m),
-            kf_yaw_deg=float(state.kf_yaw_deg),
             loop_check_every=int(state.loop_check_every),
             loop_topk=int(state.loop_topk),
             loop_min_icp_fit=float(state.loop_min_icp_fit),
-            loop_verify=str(state.loop_verify),
+            sc_n_ring=int(state.sc_n_ring),
+            sc_n_sector=int(state.sc_n_sector),
+            window_horizon=int(state.window_horizon),
+            kf_dist_m=float(state.kf_dist_m),
+            kf_yaw_deg=float(state.kf_yaw_deg),
         )
-
         s.min_d = float(state.min_d); s.max_d = float(state.max_d)
         s.ds_voxel = float(state.ds_voxel); s.loop_on = bool(state.loop_on)
         return s
@@ -1088,35 +1426,34 @@ def build_app(seq_dir: str, fps: int = 10):
 
     def update_map_actor():
         nonlocal slam
-        if slam is None: return
+        if slam is None:
+            return
 
+        # Read only small shared fields under slam.lock
         with slam.lock:
             ver = slam.map_version
-            prog = float(slam.progress)
-            running = bool(slam.running)
+            running = slam.running
             need_points = slam._map_dirty
+            prog = float(slam.progress)
 
-        state.map_progress = prog; state.map_building = running
+        state.map_progress = prog
+        state.map_building = running
 
-        # Publish-skipping while building
         if running and last_published_version["v"] >= 0:
             if (ver - last_published_version["v"]) < max(1, as_int(state.map_publish_every_n, 8)):
                 return
-
         if ver == last_map_version["v"]:
             return
+        if not need_points:
+            return
 
-        # Only now do the potentially expensive conversion path
-        with slam.lock:
-            if not need_points:
-                return
-            # Incremental map array update
-            slam.map.ensure_array()
-            slam.map.apply_dirty()
-            pts_full = slam.map.view_points()
-            slam._map_dirty = False
+        # Touch the VoxelMap under map_lock only
+        slam.map.ensure_array()
+        slam.map.apply_dirty()
+        pts_full = slam.map.view_points()
+        slam._map_dirty = False
 
-        # Cap publish size with adaptive stride
+        # Downsample for publishing and push to VTK (unchanged)
         s = stride_for_map()
         cap = max(150_000, as_int(state.max_publish_points, 300_000))
         pts = pts_full
@@ -1127,12 +1464,12 @@ def build_app(seq_dir: str, fps: int = 10):
 
         publish_map_points(pts)
         swap_map_mapper()
-
         if len(pts) > 0:
             fit_camera_once(ren_right, side="right", margin=2.4)
 
         last_map_version["v"] = ver
         last_published_version["v"] = ver
+
 
     def update_frame(force=False):
         idx = int(state.frame)
@@ -1208,8 +1545,8 @@ def build_app(seq_dir: str, fps: int = 10):
         except Exception: pass
         nonlocal slam
         try:
-            if slam is not None and slam.is_alive():
-                slam.stop(); time.sleep(0.05)
+            if _slam_is_alive(slam):
+                _slam_stop(slam); time.sleep(0.05)
                 if state.slam_on:
                     slam = make_slam(); slam.start()
         except Exception:
@@ -1219,11 +1556,13 @@ def build_app(seq_dir: str, fps: int = 10):
     def start_stop_slam():
         nonlocal slam
         if state.slam_on:
-            if slam is None or not slam.is_alive():
-                slam = make_slam(); slam.start()
+            if not _slam_is_alive(slam):
+                slam = make_slam(); _slam_start(slam)
         else:
-            if slam is not None and slam.is_alive():
-                slam.stop()
+            if _slam_is_alive(slam):
+                _slam_stop(slam)
+
+
     ctrl.start_stop_slam = start_stop_slam
 
     def build_full_map():
@@ -1232,8 +1571,9 @@ def build_app(seq_dir: str, fps: int = 10):
         # clear visible map immediately
         publish_map_points(np.empty((0, 4), np.float32)); ctrl.view_update()
 
-        if slam is not None and slam.is_alive():
-            slam.stop(); time.sleep(0.05)
+        if _slam_is_alive(slam):
+            _slam_stop(slam); time.sleep(0.05)
+
         n = len(files)
         state.optimize_every = max(1000, n // 3)
         state.loop_stride    = max(4, state.loop_stride)
@@ -1247,28 +1587,36 @@ def build_app(seq_dir: str, fps: int = 10):
         last_map_version["v"] = -1
         last_published_version["v"] = -1
         _first_fit_done["left"] = False; _first_fit_done["right"] = False
-        slam.start()
+        
+        _slam_start(slam)
+        print("[UI] build_full_map: pipeline started")
         update_view_layout(); ctrl.view_update()
     ctrl.build_full_map = build_full_map
 
     def force_rebuild():
-        """Rebuild map arrays from current VoxelMap (incremental already in place)."""
         nonlocal slam
-        if slam is None: return
-        with slam.lock:
+        if slam is None:
+            return
+        with slam.map_lock:
             slam.map.ensure_array()
             slam.map.apply_dirty()
-            slam._map_dirty = True  # force publish
+        with slam.lock:
+            slam._map_dirty = True
             slam.map_version += 1
         _refresh_map()
+
     ctrl.force_rebuild = force_rebuild
 
     def reset_map():
         nonlocal slam
-        if slam is not None and slam.is_alive(): slam.stop(); time.sleep(0.05)
+        if _slam_is_alive(slam):
+            _slam_stop(slam); time.sleep(0.05)
         slam = None; last_map_version["v"] = -1; last_published_version["v"] = -1
         _first_fit_done["left"] = False; _first_fit_done["right"] = False
-        publish_map_points(np.empty((0, 4), np.float32))
+
+        with slam.map_lock:
+            publish_map_points(np.empty((0, 4), np.float32))
+
         scan_mapper_std.SetInputData(np_points_to_polydata(np.empty((0,4), np.float32), state.color_mode, (0.0,1.0)))
         scan_mapper_fast.SetInputData(scan_mapper_std.GetInput())
         map_actor.SetMapper(map_mapper_std); scan_actor.SetMapper(scan_mapper_std)
@@ -1281,6 +1629,26 @@ def build_app(seq_dir: str, fps: int = 10):
     def _on_client_exited(client_id=None, **_): state.play = False
     try: server.on_client_exited.add(_on_client_exited)
     except Exception: pass
+
+    def _watchdog():
+        while True:
+            if slam is None or slam.stop_ev.is_set():
+                break
+            try:
+                # Don’t take slam.lock (avoid deadlock)
+                load_q = getattr(slam, "q_load", None)
+                odo_q  = getattr(slam, "q_odo", None)
+
+                print(
+                    f"[WDOG] idx={slam.idx} "
+                    f"progress={slam.progress:.2%} "
+                    f"loadQ={load_q.qsize() if load_q else '?'} "
+                    f"odoQ={odo_q.qsize() if odo_q else '?'} "
+                    f"running={slam.running}"
+                )
+            except Exception as e:
+                print(f"[WDOG] error: {e}")
+            time.sleep(2.0)   # every 2 seconds
 
     # ---------- UI ----------
     with SinglePageLayout(server) as layout:
@@ -1455,13 +1823,18 @@ def build_app(seq_dir: str, fps: int = 10):
         try: ctrl.start_stop_slam()
         except Exception: pass
 
+    # threading.Thread(target=_watchdog, daemon=True).start()
+
     return server
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seq_dir", required=True)
-    ap.add_argument("--port", type=int, default=1234)
-    ap.add_argument("--fps", type=int, default=10)
-    args = ap.parse_args()
-    server = build_app(args.seq_dir, fps=args.fps)
-    server.start(port=args.port)
+    # ap.add_argument("--seq_dir", required=True)
+    # ap.add_argument("--port", type=int, default=1234)
+    # ap.add_argument("--fps", type=int, default=10)
+    # args = ap.parse_args()
+
+    seq_dir = r"D:\Work\Lidar_Map_Trame\dataset\2011_10_03\2011_10_03_drive_0027_sync\velodyne_points\data"
+    fps = 10; port = 1234
+    server = build_app(seq_dir, fps=fps)
+    server.start(port=port)
