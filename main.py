@@ -195,19 +195,70 @@ def _safe_fpfh(pc: o3d.geometry.PointCloud, voxel: float):
     except Exception as e:
         print(f"[ICP ] skip FPFH: {e}")
         return None
+    
+def _o3d_make_loss(delta: float = 1.0):
+    """Open3D ≥0.19: use Loss classes; otherwise return None (no robust loss)."""
+    reg = o3d.pipelines.registration
+    for name in ("TukeyLoss", "HuberLoss", "L2Loss"):
+        if hasattr(reg, name):
+            Loss = getattr(reg, name)
+            try:
+                return Loss(delta)   # Tukey/Huber take a scale
+            except TypeError:
+                try:
+                    return Loss()    # L2Loss may be parameterless
+                except Exception:
+                    pass
+    return None  # fine to run without a robust loss
 
-def icp_transform_backend(src_pts_np: np.ndarray, tgt_pts_np: np.ndarray, voxel: float, init=np.eye(4)):
-    # Empty guards
-    if src_pts_np is None or tgt_pts_np is None or len(src_pts_np) == 0 or len(tgt_pts_np) == 0:
-        return np.eye(4, dtype=np.float32), 0.0
+def _o3d_trans_estimation(point_to_plane: bool, delta: float = 1.0):
+    """Build the proper estimator for the current Open3D version."""
+    reg = o3d.pipelines.registration
+    loss = _o3d_make_loss(delta)
+    if point_to_plane:
+        try:
+            return reg.TransformationEstimationPointToPlane(loss=loss) if loss else \
+                   reg.TransformationEstimationPointToPlane()
+        except TypeError:
+            return reg.TransformationEstimationPointToPlane()
+    else:
+        try:
+            return reg.TransformationEstimationPointToPoint(loss=loss) if loss else \
+                   reg.TransformationEstimationPointToPoint()
+        except TypeError:
+            return reg.TransformationEstimationPointToPoint()
 
-    # -------- Try GPU (Cupoch) point-to-point (fast & robust) --------
+def _ensure_normals_019(pc: o3d.geometry.PointCloud, voxel: float = 0.5):
+    # Minimal, 0.19-safe normal estimation
+    if not pc.has_normals():
+        r = max(1.5 * float(voxel), 0.6)
+        pc.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=r, max_nn=30)
+        )
+
+
+def icp_transform_backend(src_pts_np: np.ndarray,
+                          tgt_pts_np: np.ndarray,
+                          voxel: float,
+                          init=np.eye(4)):
+    """
+    Run ICP (GPU via Cupoch if available, else CPU via Open3D).
+    - Prefers Point-to-Plane ICP (needs normals).
+    - Falls back to Point-to-Point if normals or loss unavailable.
+    """
+
+    # ---------- GPU path (Cupoch) ----------
     if USE_GPU and HAVE_CUPOCH:
         try:
-            src = cph.geometry.PointCloud(); src.points = cph.utility.Vector3fVector(src_pts_np[:, :3].astype(np.float32, copy=False))
-            tgt = cph.geometry.PointCloud(); tgt.points = cph.utility.Vector3fVector(tgt_pts_np[:, :3].astype(np.float32, copy=False))
+            src = cph.geometry.PointCloud()
+            tgt = cph.geometry.PointCloud()
+            src.points = cph.utility.Vector3fVector(src_pts_np[:, :3].astype(np.float32))
+            tgt.points = cph.utility.Vector3fVector(tgt_pts_np[:, :3].astype(np.float32))
+
             if voxel and voxel > 0:
-                src = src.voxel_down_sample(float(voxel)); tgt = tgt.voxel_down_sample(float(voxel))
+                src = src.voxel_down_sample(float(voxel))
+                tgt = tgt.voxel_down_sample(float(voxel))
+
             max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
             result = cph.registration.registration_icp(
                 src, tgt, max_corr, init.astype(np.float32),
@@ -218,63 +269,44 @@ def icp_transform_backend(src_pts_np: np.ndarray, tgt_pts_np: np.ndarray, voxel:
             fit = float(getattr(result, "fitness", 1.0))
             return T, fit
         except Exception as e:
-            print(f"[ICP ] GPU path failed, falling back to CPU: {e}")
+            log(f"[ICP ] GPU ICP failed, falling back to CPU: {e}", level=1)
 
-    # -------- CPU multiscale Point-to-Plane (accurate) --------
-    try:
-        base = max(0.3, float(voxel) if voxel and voxel > 0 else 0.4)
-        levels = []
-        for s in (3.0, 1.5, 1.0):
-            v = base * s
-            # light downsample
-            def _ds(x): 
-                if v <= 0: return x
-                return voxel_downsample(x, v)
-            src_ds = _ds(src_pts_np); tgt_ds = _ds(tgt_pts_np)
-            if len(src_ds) == 0 or len(tgt_ds) == 0: 
-                continue
-            levels.append((src_ds, tgt_ds, v))
-        if levels:
-            T = init.astype(np.float64, copy=True)
-            last_fit = 0.0
-            for (src_ds, tgt_ds, v) in levels:
-                src = _o3d_pc_from_np(src_ds)
-                tgt = _o3d_pc_from_np(tgt_ds)
-                # ensure normals for P2L
-                nr = max(0.8, 2.0 * v)
-                _ensure_normals(src, radius=nr, max_nn=60)
-                _ensure_normals(tgt, radius=nr, max_nn=60)
-                max_corr = max(2.5 * v, 0.8)
-                loss = o3d.pipelines.registration.RobustKernel(
-                    o3d.pipelines.registration.RobustKernelType.Huber, 1.0
-                )
-                estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane(loss)
-                criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=30 if v > base*1.6 else 50
-                )
-                res = o3d.pipelines.registration.registration_icp(src, tgt, max_corr, T, estimation, criteria)
-                T = res.transformation
-                last_fit = float(res.fitness)
-            return np.array(T, dtype=np.float32), last_fit
-    except Exception as e:
-        print(f"[ICP ] CPU P2L path failed, will try P2P: {e}")
+    # ---------- CPU path (Open3D) ----------
+    src = o3d.geometry.PointCloud()
+    tgt = o3d.geometry.PointCloud()
+    src.points = o3d.utility.Vector3dVector(src_pts_np[:, :3].astype(np.float64))
+    tgt.points = o3d.utility.Vector3dVector(tgt_pts_np[:, :3].astype(np.float64))
 
-    # -------- CPU point-to-point fallback (never needs normals) --------
+    if voxel and voxel > 0:
+        src = src.voxel_down_sample(float(voxel))
+        tgt = tgt.voxel_down_sample(float(voxel))
+
+    max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
+
+    # Try Point-to-Plane ICP if normals can be estimated
     try:
-        src = _o3d_pc_from_np(src_pts_np)
-        tgt = _o3d_pc_from_np(tgt_pts_np)
-        if voxel and voxel > 0:
-            src = src.voxel_down_sample(float(voxel)); tgt = tgt.voxel_down_sample(float(voxel))
-        max_corr = max(2.0 * float(voxel), 1.0) if voxel and voxel > 0 else 1.0
-        res = o3d.pipelines.registration.registration_icp(
+        src.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
+        tgt.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
+
+        est = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        result = o3d.pipelines.registration.registration_icp(
             src, tgt, max_corr, init,
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            est,
             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25),
         )
-        return np.array(res.transformation, dtype=np.float32), float(res.fitness)
+        T = np.array(result.transformation, dtype=np.float32)
+        fit = float(result.fitness)
+        return T, fit
     except Exception as e:
-        print(f"[ICP ] CPU P2P also failed, returning identity: {e}")
-        return np.eye(4, dtype=np.float32), 0.0
+        log(f"[ICP ] CPU P2L path failed, falling back to P2P: {e}", level=1)
+
+    # Fallback: Point-to-Point ICP
+    result = o3d.pipelines.registration.registration_icp(
+        src, tgt, max_corr, init,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25),
+    )
+    return np.array(result.transformation, dtype=np.float32), float(result.fitness)
 
 # --------- Scan-context ---------
 def make_scan_context(points: np.ndarray, n_ring=20, n_sector=60, max_range=80.0) -> np.ndarray:
@@ -1829,12 +1861,10 @@ def build_app(seq_dir: str, fps: int = 10):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    # ap.add_argument("--seq_dir", required=True)
-    # ap.add_argument("--port", type=int, default=1234)
-    # ap.add_argument("--fps", type=int, default=10)
-    # args = ap.parse_args()
+    ap.add_argument("--seq_dir", default=r"D:\Work\Lidar_Map_Trame\dataset\2011_10_03\2011_10_03_drive_0027_sync\velodyne_points\data")
+    ap.add_argument("--port", type=int, default=1234)
+    ap.add_argument("--fps", type=int, default=10)
+    args = ap.parse_args()
 
-    seq_dir = r"D:\Work\Lidar_Map_Trame\dataset\2011_10_03\2011_10_03_drive_0027_sync\velodyne_points\data"
-    fps = 10; port = 1234
-    server = build_app(seq_dir, fps=fps)
-    server.start(port=port)
+    server = build_app(args.seq_dir, fps=args.fps)
+    server.start(port=args.port)
