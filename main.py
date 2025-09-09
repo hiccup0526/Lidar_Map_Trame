@@ -55,6 +55,7 @@ def as_float(v, default=0.0):
     except Exception: return default
 
 LOG_LEVEL = 2   # 1 = verbose, 2 = silent
+client_connected = {"v": False}
 
 def log(msg, level=1, **kwargs):
     """
@@ -1006,6 +1007,22 @@ def build_app(seq_dir: str, fps: int = 10):
     server = get_server(client_type="vue2")
     state, ctrl = server.state, server.controller
 
+    def _on_client_connected(client_id=None, **_):
+        client_connected["v"] = True
+    def _on_client_exited(client_id=None, **_):
+        client_connected["v"] = False
+        # also stop any playback / timers you keep on the server side
+        state.play = False
+
+    try:
+        server.on_client_connected.add(_on_client_connected)
+    except Exception:
+        pass
+    try:
+        server.on_client_exited.add(_on_client_exited)
+    except Exception:
+        pass
+
     # ----- Render window -----
     rw = vtk.vtkRenderWindow()
     try: rw.SetNumberOfLayers(2)
@@ -1207,16 +1224,26 @@ def build_app(seq_dir: str, fps: int = 10):
         return s
 
     def push_view():
+        # throttle same as before
         now = time.perf_counter()
         min_dt = MIN_PUSH_DT_INTER if bool(state.interacting) else MIN_PUSH_DT_IDLE
         if pushing["v"] or (now - _last_push["t"] < min_dt):
             return
         pushing["v"] = True
         try:
-            ctrl.view_update()
+            # Always run the compute/publish path above push_view()
+            # Only guard the actual websocket send:
+            try:
+                ctrl.view_update()           # this calls VtkRemoteView.update()
+            except Exception as e:
+                # socket may be gone; silence & keep pipeline running
+                if "closing transport" in str(e).lower() or "websocket" in str(e).lower():
+                    client_connected["v"] = False
+                # don't re-raise
         finally:
             pushing["v"] = False
             _last_push["t"] = time.perf_counter()
+
 
     def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
         if points.size == 0: return points
@@ -1641,21 +1668,68 @@ def build_app(seq_dir: str, fps: int = 10):
 
     def reset_map():
         nonlocal slam
+        # Stop threads if running
         if _slam_is_alive(slam):
-            _slam_stop(slam); time.sleep(0.05)
-        slam = None; last_map_version["v"] = -1; last_published_version["v"] = -1
-        _first_fit_done["left"] = False; _first_fit_done["right"] = False
+            try:
+                _slam_stop(slam)
+                time.sleep(0.05)
+            except Exception:
+                pass
 
-        with slam.map_lock:
+        # Best-effort clear internal structures if we still have an instance
+        try:
+            if slam is not None:
+                with slam.lock:
+                    try:
+                        slam.map.clear()
+                    except Exception:
+                        pass
+                    slam._map_dirty = False
+        except Exception:
+            pass
+
+        # Drop the instance
+        slam = None
+
+        # Reset publish/version state
+        last_map_version["v"] = -1
+        last_published_version["v"] = -1
+        _first_fit_done["left"] = False
+        _first_fit_done["right"] = False
+        state.map_progress = 0.0
+        state.map_building = False
+
+        # Clear VTK pipelines (map + scan) safely
+        try:
             publish_map_points(np.empty((0, 4), np.float32))
+        except Exception:
+            pass
 
-        scan_mapper_std.SetInputData(np_points_to_polydata(np.empty((0,4), np.float32), state.color_mode, (0.0,1.0)))
-        scan_mapper_fast.SetInputData(scan_mapper_std.GetInput())
-        map_actor.SetMapper(map_mapper_std); scan_actor.SetMapper(scan_mapper_std)
-        marker_actor.SetVisibility(False)
-        state.map_progress = 0.0; state.map_building = False
-        update_view_layout()
-        ctrl.view_update()
+        try:
+            empty_poly = np_points_to_polydata(np.empty((0, 4), np.float32), state.color_mode, (0.0, 1.0))
+            scan_mapper_std.SetInputData(empty_poly)
+            scan_mapper_fast.SetInputData(empty_poly)
+        except Exception:
+            pass
+
+        # Reset actors/mappers/marker
+        try:
+            map_actor.SetMapper(map_mapper_std)
+            scan_actor.SetMapper(scan_mapper_std)
+        except Exception:
+            pass
+        try:
+            marker_actor.SetVisibility(False)
+        except Exception:
+            pass
+
+        # Refresh layout & view
+        try:
+            update_view_layout()
+            ctrl.view_update()
+        except Exception:
+            pass
+
     ctrl.reset_map = reset_map
 
     def _on_client_exited(client_id=None, **_): state.play = False
@@ -1839,10 +1913,10 @@ def build_app(seq_dir: str, fps: int = 10):
                         classes="vtk-wrap",
                         style="width:100%; height:100%;",
                         interactive_ratio=6,
-                        interactive_quality=25,
+                        interactive_quality=20,
                         still_ratio=1,
-                        still_quality=55,
-                        max_image_size=512,
+                        still_quality=45,
+                        max_image_size=480,
                     ) as view:
                         def _safe_update():
                             try: view.update()
