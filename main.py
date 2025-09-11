@@ -664,6 +664,7 @@ class PipelineSLAM:
                     with self.lock:
                         self.frames.append(pts_k)
                         self.descs[0] = sc0
+                        # (leave as-is) initial insert for k=0
                         self.map.insert(pts_k, np.eye(4))
                         self._mark_dirty()
                         self.last_processed_idx = 0
@@ -674,7 +675,6 @@ class PipelineSLAM:
                     continue
 
                 # ---- normal path (k>0) ----
-                # Guard against empty inputs
                 if pts_k is None or len(pts_k) == 0 or prev_pts is None or len(prev_pts) == 0:
                     log(f"[ODO ] skip ICP at k={k} (empty cloud)", flush=True)
                     prev_pts = pts_k
@@ -682,18 +682,16 @@ class PipelineSLAM:
 
                 try:
                     T_cur_to_prev, fit = self.icp_with_timeout(
-                        pts_k,                               # src_pts_np
-                        prev_pts if prev_pts is not None else pts_k,  # tgt_pts_np
-                        self.icp_voxel,                      # voxel
-                        np.eye(4, dtype=np.float32),         # init
-                        timeout=2.5,                         # seconds
-                        frame_idx=k,                         # for logs (optional)
+                        pts_k,
+                        prev_pts if prev_pts is not None else pts_k,
+                        self.icp_voxel,
+                        np.eye(4, dtype=np.float32),
+                        timeout=2.5,
+                        frame_idx=k,
                     )
                 except Exception as e:
                     print(f"[ODO ] ICP failed, using identity. err={e!r}")
                     T_cur_to_prev, fit = (np.eye(4, dtype=np.float32), 0.0)
-
-                T_k = None
 
                 MIN_ODOM_FIT = 0.10
                 with self.lock:
@@ -709,7 +707,6 @@ class PipelineSLAM:
                             )
                         )
                     else:
-                        # Add a very weak edge (or skip entirely) so optimization won’t snap to garbage
                         info = np.identity(6, dtype=np.float32) * 1e-3
                         self.pose_graph.edges.append(
                             o3d.pipelines.registration.PoseGraphEdge(
@@ -717,22 +714,20 @@ class PipelineSLAM:
                             )
                         )
 
-                    # Map insert only after pose update
-                    self.map.insert(pts_k, T_k)
-                    self._mark_dirty()   # just flips a flag; safe & fast
-
+                # (unchanged) compute SC and keyframe logic
                 sc_k = make_scan_context(pts_k, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
                 if self._needs_keyframe(T_k):
                     with self.lock:
                         self._loopdb_add(k, sc_k)
                         self._last_kf_pose = T_k.copy()
 
+                # ---- single map insert (keep this one) ----
                 with self.map_lock:
                     self.map.insert(pts_k, T_k)
+                self._mark_dirty()  # mark once; remove any duplicate bumps
 
                 with self.lock:
-                    self._map_dirty = True
-                    self.map_version += 1
+                    # (keep only bookkeeping here; removed the duplicate _map_dirty / map_version)
                     self.last_processed_idx = k
                     self.progress = k / max(1, self.n - 1)
                     blk = k // 500
@@ -752,7 +747,7 @@ class PipelineSLAM:
             import traceback
             print("[ODO ] fatal:", repr(e), flush=True)
             traceback.print_exc()
-            # Don’t swallow; exiting is fine so you see the error
+
 
     def _worker_loop_global(self):
         log("[LOOP] start", flush=True)
@@ -1169,8 +1164,8 @@ def build_app(seq_dir: str, fps: int = 10):
     pushing = {"v": False}
     last_fast = {"v": False}
     _last_push = {"t": 0.0}
-    MIN_PUSH_DT_IDLE = 1.0 / 10.0      # at most ~8 fps when idle
-    MIN_PUSH_DT_INTER = 1.0 / 5.0     # at most ~4 fps while interacting (scroll/zoom)
+    MIN_PUSH_DT_IDLE = 1.0 / 2.0      # at most ~8 fps when idle
+    MIN_PUSH_DT_INTER = 1.0 / 1.0     # at most ~4 fps while interacting (scroll/zoom)
 
     # Prefetch
     PREFETCH = 24
@@ -1634,11 +1629,14 @@ def build_app(seq_dir: str, fps: int = 10):
             _slam_stop(slam); time.sleep(0.05)
 
         n = len(files)
-        state.optimize_every = max(1000, n // 3)
+        state.optimize_every = 400
         state.loop_stride    = max(4, state.loop_stride)
-        state.map_voxel      = max(0.45, as_float(state.map_voxel, 0.45))
-        state.ds_voxel       = max(0.35, as_float(state.ds_voxel, 0.35))
+        state.map_voxel      = max(0.5, as_float(state.map_voxel, 0.45))
+        state.ds_voxel       = max(0.5, as_float(state.ds_voxel, 0.35))
         state.icp_voxel      = max(0.8,  as_float(state.icp_voxel, 0.8))
+        state.sc_n_sector    = 60
+        state.map_publish_every_n = 10
+        state.ui_publish_stride = 12
         state.rebuild_after_opt = False
 
         slam = make_slam()
