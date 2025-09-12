@@ -1,0 +1,97 @@
+GPU - 1
+[SLAM] Frames 1–500: 91.79 s (5.45 Hz avg)
+[SLAM] Frames 501–1000: 82.37 s (6.07 Hz avg)
+[SLAM] Frames 1001–1500: 84.70 s (5.90 Hz avg)
+[SLAM] Frames 1501–2000: 84.41 s (5.92 Hz avg)
+[SLAM] Frames 2001–2500: 85.25 s (5.87 Hz avg)
+[SLAM] Frames 2501–3000: 87.63 s (5.71 Hz avg)
+[SLAM] Frames 3001–3500: 89.81 s (5.57 Hz avg)
+[SLAM] Frames 3501–4000: 84.37 s (5.93 Hz avg)
+[SLAM] Frames 4001–4500: 89.84 s (5.57 Hz avg)
+
+CPU - 1
+[SLAM] Frames 1–500: 76.41 s (6.54 Hz avg)
+[SLAM] Frames 501–1000: 94.83 s (5.27 Hz avg)
+[SLAM] Frames 1001–1500: 103.81 s (4.82 Hz avg)
+[SLAM] Frames 1501–2000: 99.49 s (5.03 Hz avg)
+[SLAM] Frames 2001–2500: 96.74 s (5.17 Hz avg)
+[SLAM] Frames 2501–3000: 99.10 s (5.05 Hz avg)
+[SLAM] Frames 3001–3500: 101.03 s (4.95 Hz avg)
+[SLAM] Frames 3501–4000: 92.84 s (5.39 Hz avg)
+[SLAM] Frames 4001–4500: 96.62 s (5.17 Hz avg
+
+GPU - 2
+[PIPE] 500 frames processed (+500) in 75.46s  | avg 6.63 FPS
+[PIPE] 1000 frames processed (+500) in 78.56s  | avg 6.36 FPS
+[PIPE] 1500 frames processed (+500) in 82.69s  | avg 6.05 FPS
+[PIPE] 2000 frames processed (+500) in 88.00s  | avg 5.68 FPS
+[PIPE] 2500 frames processed (+500) in 90.94s  | avg 5.50 FPS
+[PIPE] 3000 frames processed (+500) in 79.33s  | avg 6.30 FPS
+[PIPE] 3500 frames processed (+500) in 78.90s  | avg 6.34 FPS
+[PIPE] 4000 frames processed (+500) in 78.58s  | avg 6.36 FPS
+[PIPE] 4500 frames processed (+500) in 83.48s  | avg 5.99 FPS
+
+CPU - 2
+[PIPE] 500 frames processed (+500) in 73.93s  | avg 6.76 FPS
+[PIPE] 1000 frames processed (+500) in 76.16s  | avg 6.56 FPS
+[PIPE] 1500 frames processed (+500) in 78.92s  | avg 6.34 FPS
+[PIPE] 2000 frames processed (+500) in 77.49s  | avg 6.45 FPS
+[PIPE] 2500 frames processed (+500) in 79.40s  | avg 6.30 FPS
+[PIPE] 3000 frames processed (+500) in 77.61s  | avg 6.44 FPS
+[PIPE] 3500 frames processed (+500) in 74.20s  | avg 6.74 FPS
+[PIPE] 4000 frames processed (+500) in 74.25s  | avg 6.73 FPS
+
+new method
+CPU - 3
+[PIPE] 500 frames processed (+500) in 82.25s  | avg 6.08 FPS
+[PIPE] 1000 frames processed (+500) in 84.61s  | avg 5.91 FPS
+[PIPE] 1500 frames processed (+500) in 86.59s  | avg 5.77 FPS
+[PIPE] 2000 frames processed (+500) in 88.18s  | avg 5.67 FPS
+[PIPE] 2500 frames processed (+500) in 86.89s  | avg 5.75 FPS
+[PIPE] 3000 frames processed (+500) in 84.58s  | avg 5.91 FPS
+[PIPE] 3500 frames processed (+500) in 87.22s  | avg 5.73 FPS
+[PIPE] 4000 frames processed (+500) in 84.82s  | avg 5.89 FPS
+[PIPE] 4500 frames processed (+500) in 89.51s  | avg 5.59 FPS
+
+GPU - 3
+[PIPE] 500 frames processed (+500) in 74.04s  | avg 6.75 FPS
+[PIPE] 1000 frames processed (+500) in 75.15s  | avg 6.65 FPS
+[PIPE] 1500 frames processed (+500) in 82.19s  | avg 6.08 FPS
+[PIPE] 2000 frames processed (+500) in 89.53s  | avg 5.59 FPS
+[PIPE] 2500 frames processed (+500) in 80.91s  | avg 6.18 FPS
+[PIPE] 3500 frames processed (+500) in 79.86s  | avg 6.26 FPS
+[PIPE] 4000 frames processed (+500) in 79.99s  | avg 6.25 FPS
+[PIPE] 4500 frames processed (+500) in 102.21s  | avg 4.89 FPS
+
+GPU - 4
+[PIPE] 500 frames processed (+500) in 73.90s  | avg 6.77 FPS
+[PIPE] 1000 frames processed (+500) in 74.55s  | avg 6.71 FPS
+[PIPE] 1500 frames processed (+500) in 77.18s  | avg 6.48 FPS
+[PIPE] 2000 frames processed (+500) in 75.28s  | avg 6.64 FPS
+[PIPE] 2500 frames processed (+500) in 77.14s  | avg 6.48 FPS
+[PIPE] 3000 frames processed (+500) in 79.93s  | avg 6.26 FPS
+[PIPE] 3500 frames processed (+500) in 76.99s  | avg 6.49 FPS
+[PIPE] 4000 frames processed (+500) in 76.47s  | avg 6.54 FPS
+[PIPE] 4500 frames processed (+500) in 82.09s  | avg 6.09 FPS
+
+CPU - 4
+[PIPE] 500 frames processed (+500) in 81.71s  | avg 6.12 FPS
+[PIPE] 1000 frames processed (+500) in 84.01s  | avg 5.95 FPS
+[PIPE] 1500 frames processed (+500) in 85.89s  | avg 5.82 FPS
+[PIPE] 2000 frames processed (+500) in 85.15s  | avg 5.87 FPS
+[PIPE] 2500 frames processed (+500) in 85.03s  | avg 5.88 FPS
+[PIPE] 3000 frames processed (+500) in 82.64s  | avg 6.05 FPS
+[PIPE] 3500 frames processed (+500) in 84.95s  | avg 5.89 FPS
+[PIPE] 4000 frames processed (+500) in 83.34s  | avg 6.00 FPS
+[PIPE] 4500 frames processed (+500) in 87.56s  | avg 5.71 FPS
+
+CPU - 5
+[PIPE] 500 frames processed (+500) in 64.19s  | avg 7.79 FPS
+[PIPE] 1000 frames processed (+500) in 65.60s  | avg 7.62 FPS
+[PIPE] 1500 frames processed (+500) in 65.59s  | avg 7.62 FPS
+[PIPE] 2000 frames processed (+500) in 64.62s  | avg 7.74 FPS
+[PIPE] 2500 frames processed (+500) in 65.12s  | avg 7.68 FPS
+[PIPE] 3000 frames processed (+500) in 64.37s  | avg 7.77 FPS
+[PIPE] 3500 frames processed (+500) in 66.11s  | avg 7.56 FPS
+[PIPE] 4000 frames processed (+500) in 66.81s  | avg 7.48 FPS
+[PIPE] 4500 frames processed (+500) in 76.79s  | avg 6.51 FPS

@@ -163,7 +163,7 @@ def np_to_vtk_matrix(T: np.ndarray) -> vtk.vtkMatrix4x4:
     return m
 
 # --------- ICP backend ---------
-USE_GPU = HAVE_CUPOCH
+USE_GPU = False
 
 def _o3d_pc_from_np(pts_np: np.ndarray) -> o3d.geometry.PointCloud:
     pc = o3d.geometry.PointCloud()
@@ -1099,7 +1099,7 @@ def build_app(seq_dir: str, fps: int = 10):
     state.auto_intensity = True
     state.i_low = 0.0; state.i_high = 1.0
     state.min_d = 0.0; state.max_d = 0.0
-    state.show_current = True; state.use_world_pose = True
+    state.show_current = False; state.use_world_pose = True
     state.highlight_scan = False
     state.map_stride = 8
     state.scan_stride = 3
@@ -1107,7 +1107,7 @@ def build_app(seq_dir: str, fps: int = 10):
     state.interacting = False
 
     # layout & interaction
-    state.split_view = True
+    state.split_view = False
     state.map_only_on_build = True
     state.pan_mode = True
 
@@ -1142,7 +1142,7 @@ def build_app(seq_dir: str, fps: int = 10):
     state.map_publish_every_n = 8
 
     # CPU⇄GPU toggle
-    state.use_gpu = True
+    state.use_gpu = False
     # --- cadence / throttling ---
     state.ui_publish_stride = 10     # update visualization every N frames (5–10 is good)
 
