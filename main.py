@@ -781,14 +781,51 @@ class PipelineSLAM:
 
     def _worker_odometry_map(self):
         """
-        Odometry + mapping worker:
-        - Registers current scan to previous scan (scan→scan ICP)
-        - Uses GPS relative motion as ICP init if available, else last-delta prior
-        - Inserts each frame into the global VoxelMap exactly ONCE
-        - Adds weak GPS edges every N frames (if configured)
-        - Computes scan-context ONLY on keyframes
+        Odometry + mapping worker (CPU-optimized):
+        - Primary mode: scan→scan ICP
+        - Adaptive: skip ICP on easy frames, predict using GPS rel or last motion
+        - Limits ICP cost via radius-crop + point cap
+        - Exactly ONE map insert per frame
+        - Scan-context only on keyframes
         """
         log("[ODO ] start", flush=True)
+
+        # ---- runtime defaults (tunable without changing __init__) ----
+        # Run a full ICP at least every N frames; skip in-between if last fit is good
+        icp_every_n       = int(getattr(self, "icp_every_n", 2))        # 2 = run ICP on ~every other frame
+        icp_fit_easy_thr  = float(getattr(self, "icp_fit_easy_thr", 0.55))  # if last fit ≥ this, we can skip next ICP
+        icp_fit_hard_thr  = float(getattr(self, "icp_fit_hard_thr", 0.30))  # if last fit < this, force next ICP
+        # Cap the number of points sent into ICP (per cloud)
+        icp_max_points    = int(getattr(self, "icp_max_points", 50_000))     # keep target/source ≤ 50k
+        # Optional quick crop by XY radius (meters) to avoid far points in ICP
+        icp_crop_radius_m = float(getattr(self, "icp_crop_radius_m", 0.0))   # 0 = off; try 45–60 on highways
+        # ICP timeout (seconds)
+        icp_timeout_s     = float(getattr(self, "icp_timeout_s", 2.0))
+
+        # Internal state (initialized if missing)
+        if not hasattr(self, "_last_delta"):
+            self._last_delta = np.eye(4, dtype=np.float32)
+        if not hasattr(self, "_last_fit"):
+            self._last_fit = 1.0
+        if not hasattr(self, "_icp_cooldown"):
+            self._icp_cooldown = 0
+        if not hasattr(self, "_icp_mod_counter"):
+            self._icp_mod_counter = 0  # counts frames since last true ICP
+
+        def crop_radius_xy(pts: np.ndarray, r: float) -> np.ndarray:
+            if r is None or r <= 0 or pts is None or len(pts) == 0:
+                return pts
+            P = pts[:, :3]
+            m = (P[:, 0] * P[:, 0] + P[:, 1] * P[:, 1]) <= (r * r)
+            return pts[m] if np.any(m) else pts
+
+        def cap_points(pts: np.ndarray, cap: int) -> np.ndarray:
+            if pts is None or len(pts) <= cap or cap <= 0:
+                return pts
+            # fast stride downsampling (keeps order; good enough for ICP)
+            stride = int(np.ceil(len(pts) / float(cap)))
+            return pts[::max(1, stride)]
+
         prev_pts = None
         try:
             while not self.stop_ev.is_set():
@@ -831,6 +868,11 @@ class PipelineSLAM:
                         self.q_odo.put((k, pts_k[::4], np.eye(4, dtype=np.float32), True), timeout=0.5)
                     except queue.Full:
                         pass
+                    # reset cadence state
+                    self._last_delta = np.eye(4, dtype=np.float32)
+                    self._last_fit = 1.0
+                    self._icp_cooldown = 0
+                    self._icp_mod_counter = 0
                     continue
 
                 # ---- normal path (k>0) ----
@@ -839,28 +881,62 @@ class PipelineSLAM:
                     prev_pts = pts_k
                     continue
 
-                # --- choose ICP initial guess ---
-                init_guess = getattr(self, "_last_delta", np.eye(4, dtype=np.float32))
+                # --- choose initial guess: GPS rel if available, else last motion ---
+                init_guess = self._last_delta
                 if getattr(self, "use_gps_init", False) and getattr(self, "gps_rel", None) is not None and k < len(self.gps_rel):
                     try:
                         init_guess = np.asarray(self.gps_rel[k], dtype=np.float32)
                     except Exception:
-                        # fall back to last-delta prior
                         pass
 
-                # --- run ICP (scan k -> scan k-1) ---
-                try:
-                    T_cur_to_prev, fit = self.icp_with_timeout(
-                        pts_k,                   # source (current)
-                        prev_pts,                # target (previous)
-                        self.icp_voxel,
-                        init_guess,
-                        timeout=2.0,
-                        frame_idx=k,
-                    )
-                except Exception as e:
-                    print(f"[ODO ] ICP failed, using identity. err={e!r}")
-                    T_cur_to_prev, fit = (np.eye(4, dtype=np.float32), 0.0)
+                # --- decide whether to RUN ICP this frame or PREDICT ---
+                run_icp = True
+                # cadence: at least every icp_every_n frames, run ICP
+                if icp_every_n > 1:
+                    if (self._icp_mod_counter % icp_every_n) != 0:
+                        run_icp = False
+                # if last fit was bad → force ICP
+                if self._last_fit < icp_fit_hard_thr:
+                    run_icp = True
+                # if last fit very good → allow skip
+                if self._last_fit >= icp_fit_easy_thr and icp_every_n > 1:
+                    # keep decision from cadence above (likely skip)
+                    pass
+
+                # also honor cool-down forcing (if set externally)
+                if getattr(self, "_icp_cooldown", 0) > 0:
+                    run_icp = False
+                    self._icp_cooldown = max(0, self._icp_cooldown - 1)
+
+                # --- PREP inputs (cheap crop + cap) ---
+                if run_icp:
+                    src = pts_k
+                    tgt = prev_pts
+                    if icp_crop_radius_m > 0.0:
+                        src = crop_radius_xy(src, icp_crop_radius_m)
+                        tgt = crop_radius_xy(tgt, icp_crop_radius_m)
+                    if icp_max_points > 0:
+                        src = cap_points(src, icp_max_points)
+                        tgt = cap_points(tgt, icp_max_points)
+
+                # --- RUN or PREDICT ---
+                if run_icp:
+                    try:
+                        T_cur_to_prev, fit = self.icp_with_timeout(
+                            src, tgt, self.icp_voxel, init_guess,
+                            timeout=icp_timeout_s, frame_idx=k,
+                        )
+                        self._icp_mod_counter = 1  # reset cadence counter (we just ran ICP)
+                    except Exception as e:
+                        print(f"[ODO ] ICP failed, predicting. err={e!r}")
+                        T_cur_to_prev, fit = (init_guess.astype(np.float32, copy=True), 0.0)
+                        # next frame, force an ICP
+                        self._icp_mod_counter = icp_every_n  # so (mod N)==0 next loop
+                else:
+                    # Predict this frame's relative motion (cheap): use GPS rel or last delta
+                    T_cur_to_prev = init_guess.astype(np.float32, copy=True)
+                    fit = float(self._last_fit) * 0.98  # decays slightly when predicting
+                    self._icp_mod_counter += 1
 
                 # --- update absolute pose & pose graph ---
                 with self.lock:
@@ -869,10 +945,11 @@ class PipelineSLAM:
                     self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(T_k.copy()))
 
                     MIN_ODOM_FIT = 0.10
-                    if fit >= MIN_ODOM_FIT:
+                    if run_icp and fit >= MIN_ODOM_FIT:
                         info = np.identity(6, dtype=np.float32) * max(100.0 * fit, 10.0)
                         uncertain = False
                     else:
+                        # weak/uncertain when predicted or bad fit
                         info = np.identity(6, dtype=np.float32) * 1e-3
                         uncertain = True
 
@@ -909,8 +986,14 @@ class PipelineSLAM:
                         self._loopdb_add(k, sc_k)
                         self._last_kf_pose = T_k.copy()
 
-                # --- update motion prior for next frame ---
+                # --- update motion prior & fit for next iteration ---
                 self._last_delta = T_cur_to_prev.astype(np.float32, copy=True)
+                self._last_fit = float(fit)
+
+                # If ICP reported excellent fit, we can skip next frame cheaply
+                if run_icp and fit >= icp_fit_easy_thr and icp_every_n > 1:
+                    # cooldown lets us skip at least the very next frame regardless of mod counter
+                    self._icp_cooldown = 1
 
                 # --- bookkeeping & periodic perf log ---
                 with self.lock:
