@@ -68,6 +68,134 @@ def log(msg, level=1, **kwargs):
         print(msg, **kwargs)
 
 # --------- IO & preprocessing ---------
+# --- KITTI OXTS (GPS/IMU) helpers -------------------------------------------
+# Works with KITTI raw "_sync" sequences: <drive>/oxts/data/*.txt
+# Optional extrinsic: <drive>/calib_imu_to_velo.txt
+
+WGS84_A = 6378137.0
+WGS84_E2 = 6.69437999014e-3
+
+def _lla_to_ecef(lat, lon, alt):
+    # lat, lon in radians
+    s = np.sin(lat); c = np.cos(lat)
+    sl = np.sin(lon); cl = np.cos(lon)
+    N = WGS84_A / np.sqrt(1.0 - WGS84_E2 * s * s)
+    x = (N + alt) * c * cl
+    y = (N + alt) * c * sl
+    z = (N * (1.0 - WGS84_E2) + alt) * s
+    return np.array([x, y, z], dtype=np.float64)
+
+def _ecef_to_enu_mat(lat0, lon0):
+    # Rotation ECEF->ENU at origin (lat0, lon0)
+    sL, cL = np.sin(lat0), np.cos(lat0)
+    sH, cH = np.sin(lon0), np.cos(lon0)
+    R = np.array([
+        [-sH,           cH,          0.0],
+        [-sL*cH, -sL*sH,  cL],
+        [ cL*cH,  cL*sH,  sL],
+    ], dtype=np.float64)
+    return R
+
+def _rpy_to_R(roll, pitch, yaw):
+    cr, sr = np.cos(roll),  np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw),   np.sin(yaw)
+    Rz = np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]], dtype=np.float64)
+    Ry = np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]], dtype=np.float64)
+    Rx = np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]], dtype=np.float64)
+    return Rz @ Ry @ Rx  # yaw→pitch→roll (KITTI OXTS convention)
+
+def _read_imu_to_velo(calib_dir: Path) -> Optional[np.ndarray]:
+    f = calib_dir / "calib_imu_to_velo.txt"
+    if not f.exists():
+        return None
+    R = np.zeros((3,3), dtype=np.float64)
+    t = np.zeros(3, dtype=np.float64)
+    for line in f.read_text().strip().splitlines():
+        if line.startswith("R:"):
+            vals = [float(x) for x in line[2:].strip().split()]
+            R = np.array(vals, dtype=np.float64).reshape(3,3)
+        elif line.startswith("T:"):
+            t = np.array([float(x) for x in line[2:].strip().split()], dtype=np.float64)
+    T = np.eye(4, dtype=np.float64)
+    T[:3,:3] = R; T[:3,3] = t
+    return T
+
+def load_kitti_oxts(seq_dir: str):
+    """
+    Returns dict with:
+      T_w_imu[k]   : 4x4 world pose for IMU (ENU origin = first frame)
+      T_w_velo[k]  : 4x4 world pose for Velodyne (if calib found else None)
+      T_rel_gps[k] : 4x4 relative motion (k-1 -> k) in IMU frame basis (then mapped to Velodyne if calib)
+      info_gps[k]  : 6x6 information matrix (weak; uses posacc/velacc if present else defaults)
+    """
+    base = Path(seq_dir).parent.parent  # go up from velodyne_points/data
+    oxts_dir = base / "oxts" / "data"
+    if not oxts_dir.exists():
+        return {"T_w_imu": None, "T_w_velo": None, "T_rel_gps": None, "info_gps": None}
+
+    files = sorted(oxts_dir.glob("*.txt"))
+    if not files:
+        return {"T_w_imu": None, "T_w_velo": None, "T_rel_gps": None, "info_gps": None}
+
+    # read OXTS lines
+    recs = []
+    for f in files:
+        v = [float(x) for x in f.read_text().strip().split()]
+        # KITTI OXTS order (subset we use): lat lon alt roll pitch yaw ... posacc velacc ...
+        lat, lon, alt = v[0], v[1], v[2]
+        roll, pitch, yaw = v[3], v[4], v[5]
+        posacc = v[23] if len(v) > 23 else 2.0   # meters (heuristic default)
+        velacc = v[24] if len(v) > 24 else 0.5   # m/s (heuristic default)
+        recs.append((lat, lon, alt, roll, pitch, yaw, posacc, velacc))
+
+    # ENU origin at first sample
+    lat0 = np.deg2rad(recs[0][0]); lon0 = np.deg2rad(recs[0][1]); alt0 = recs[0][2]
+    p0_ecef = _lla_to_ecef(lat0, lon0, alt0)
+    R_e2enu = _ecef_to_enu_mat(lat0, lon0)
+
+    T_w_imu = []
+    for (lat, lon, alt, roll, pitch, yaw, _, _) in recs:
+        latr = np.deg2rad(lat); lonr = np.deg2rad(lon)
+        p_ecef = _lla_to_ecef(latr, lonr, alt)
+        p_enu  = R_e2enu @ (p_ecef - p0_ecef)
+        R_imu  = _rpy_to_R(roll, pitch, yaw)
+        T = np.eye(4, dtype=np.float64)
+        T[:3,:3] = R_imu
+        T[:3, 3] = p_enu
+        T_w_imu.append(T)
+
+    # relative motions (k-1 -> k) in IMU world
+    T_rel_gps = [np.eye(4, dtype=np.float64)]
+    for k in range(1, len(T_w_imu)):
+        Tkm1 = T_w_imu[k-1]; Tk = T_w_imu[k]
+        T_rel = np.linalg.inv(Tkm1) @ Tk
+        T_rel_gps.append(T_rel)
+
+    # Optional: map IMU poses to Velodyne using calib_imu_to_velo
+    T_imu_to_velo = _read_imu_to_velo(base)
+    T_w_velo = None
+    if T_imu_to_velo is not None:
+        T_w_velo = [ (T @ T_imu_to_velo) for T in T_w_imu ]
+        T_rel_gps = [ np.linalg.inv(T_w_velo[k-1]) @ T_w_velo[k] if k>0 else np.eye(4) for k in range(len(T_w_imu)) ]
+
+    # crude information from OXTS accuracy (weak constraints)
+    info_gps = []
+    for (_,_,_,_,_,_, posacc, velacc) in recs:
+        # Diagonal info; inverses of variance (very weak)
+        sig_t = max(0.5, posacc)       # m
+        sig_r = np.deg2rad(3.0)        # ~3 deg default (no yaw acc provided)
+        I = np.zeros((6,6), dtype=np.float32)
+        I[0,0] = I[1,1] = I[2,2] = 1.0 / (sig_t*sig_t)
+        I[3,3] = I[4,4] = I[5,5] = 1.0 / (sig_r*sig_r)
+        info_gps.append(I)
+    return {
+        "T_w_imu": T_w_imu,
+        "T_w_velo": T_w_velo,
+        "T_rel_gps": T_rel_gps,
+        "info_gps": info_gps,
+    }
+
 def list_kitti_bins(seq_dir: str):
     p = Path(seq_dir)
     if not p.exists():
@@ -454,6 +582,7 @@ class PipelineSLAM:
         window_horizon=0,
         kf_dist_m=2.5, kf_yaw_deg=12.0,
         max_queue=4,
+        gps_prior=None, gps_edge_every: int = 0, use_gps_init: bool = True,
     ):
         # config
         self.files = files
@@ -514,6 +643,15 @@ class PipelineSLAM:
         self.map_lock = threading.Lock() 
 
         self._icp_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ICP")
+
+        # gps
+        self.gps = gps_prior or {}
+        self.gps_rel = self.gps.get("T_rel_gps")
+        self.gps_info = self.gps.get("info_gps")
+        self.gps_Tw = self.gps.get("T_w_velo") or self.gps.get("T_w_imu")
+        self.gps_edge_every = int(gps_edge_every or 0)
+        self.use_gps_init = bool(use_gps_init)
+        self._last_delta = np.eye(4, dtype=np.float32)  # still keep motion prior
 
     # --------------- life-cycle ---------------
     def start(self):
@@ -642,36 +780,57 @@ class PipelineSLAM:
         log("[LOAD] EOS", flush=True)
 
     def _worker_odometry_map(self):
+        """
+        Odometry + mapping worker:
+        - Registers current scan to previous scan (scan→scan ICP)
+        - Uses GPS relative motion as ICP init if available, else last-delta prior
+        - Inserts each frame into the global VoxelMap exactly ONCE
+        - Adds weak GPS edges every N frames (if configured)
+        - Computes scan-context ONLY on keyframes
+        """
         log("[ODO ] start", flush=True)
         prev_pts = None
         try:
             while not self.stop_ev.is_set():
+                # ---- get next preprocessed frame from loader ----
                 try:
                     item = self.q_load.get(timeout=0.5)
                 except queue.Empty:
                     continue
+
                 if item is None:
-                    try: self.q_odo.put(None, timeout=0.5)
-                    except Exception: pass
+                    # Propagate EOS to loop/global worker and exit
+                    try:
+                        self.q_odo.put(None, timeout=0.5)
+                    except Exception:
+                        pass
                     log("[ODO ] EOS", flush=True)
                     break
 
                 k, pts_k = item
                 log(f"[ODO ] got frame {k}  pts={len(pts_k)}", flush=True)
 
+                # ---- first frame bootstrap ----
                 if k == 0:
                     sc0 = make_scan_context(pts_k, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
                     with self.lock:
                         self.frames.append(pts_k)
                         self.descs[0] = sc0
-                        # (leave as-is) initial insert for k=0
-                        self.map.insert(pts_k, np.eye(4))
-                        self._mark_dirty()
+                        self.poses = [np.eye(4, dtype=np.float32)]
+                        self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
                         self.last_processed_idx = 0
-                        self.progress = 0.0 if self.n <= 1 else (0 / (self.n - 1))
+                        self.progress = 0.0
+
+                    # single insert into map @ identity
+                    with self.map_lock:
+                        self.map.insert(pts_k, np.eye(4, dtype=np.float32))
+                    self._mark_dirty()
+
                     prev_pts = pts_k
-                    try: self.q_odo.put((k, pts_k[::4], np.eye(4, dtype=np.float32), True), timeout=0.5)
-                    except queue.Full: pass
+                    try:
+                        self.q_odo.put((k, pts_k[::4], np.eye(4, dtype=np.float32), True), timeout=0.5)
+                    except queue.Full:
+                        pass
                     continue
 
                 # ---- normal path (k>0) ----
@@ -680,58 +839,85 @@ class PipelineSLAM:
                     prev_pts = pts_k
                     continue
 
+                # --- choose ICP initial guess ---
+                init_guess = getattr(self, "_last_delta", np.eye(4, dtype=np.float32))
+                if getattr(self, "use_gps_init", False) and getattr(self, "gps_rel", None) is not None and k < len(self.gps_rel):
+                    try:
+                        init_guess = np.asarray(self.gps_rel[k], dtype=np.float32)
+                    except Exception:
+                        # fall back to last-delta prior
+                        pass
+
+                # --- run ICP (scan k -> scan k-1) ---
                 try:
                     T_cur_to_prev, fit = self.icp_with_timeout(
-                        pts_k,
-                        prev_pts if prev_pts is not None else pts_k,
+                        pts_k,                   # source (current)
+                        prev_pts,                # target (previous)
                         self.icp_voxel,
-                        np.eye(4, dtype=np.float32),
-                        timeout=2.5,
+                        init_guess,
+                        timeout=2.0,
                         frame_idx=k,
                     )
                 except Exception as e:
                     print(f"[ODO ] ICP failed, using identity. err={e!r}")
                     T_cur_to_prev, fit = (np.eye(4, dtype=np.float32), 0.0)
 
-                MIN_ODOM_FIT = 0.10
+                # --- update absolute pose & pose graph ---
                 with self.lock:
                     T_k = self.poses[-1] @ T_cur_to_prev
                     self.poses.append(T_k)
                     self.pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(T_k.copy()))
 
+                    MIN_ODOM_FIT = 0.10
                     if fit >= MIN_ODOM_FIT:
                         info = np.identity(6, dtype=np.float32) * max(100.0 * fit, 10.0)
-                        self.pose_graph.edges.append(
-                            o3d.pipelines.registration.PoseGraphEdge(
-                                k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=False
-                            )
-                        )
+                        uncertain = False
                     else:
                         info = np.identity(6, dtype=np.float32) * 1e-3
-                        self.pose_graph.edges.append(
-                            o3d.pipelines.registration.PoseGraphEdge(
-                                k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=True
-                            )
-                        )
+                        uncertain = True
 
-                # (unchanged) compute SC and keyframe logic
-                sc_k = make_scan_context(pts_k, n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
+                    self.pose_graph.edges.append(
+                        o3d.pipelines.registration.PoseGraphEdge(
+                            k - 1, k, np.linalg.inv(T_cur_to_prev), info, uncertain=uncertain
+                        )
+                    )
+
+                    # Optional: add a weak GPS relative-motion edge every N frames
+                    if int(getattr(self, "gps_edge_every", 0)) > 0 and (k % int(self.gps_edge_every) == 0):
+                        if getattr(self, "gps_rel", None) is not None and k < len(self.gps_rel) and getattr(self, "gps_info", None) is not None:
+                            try:
+                                T_rel_gps = np.asarray(self.gps_rel[k], dtype=np.float32)
+                                info_gps  = np.asarray(self.gps_info[k], dtype=np.float32)
+                                self.pose_graph.edges.append(
+                                    o3d.pipelines.registration.PoseGraphEdge(
+                                        k - 1, k, np.linalg.inv(T_rel_gps), info_gps, uncertain=True
+                                    )
+                                )
+                            except Exception as e:
+                                print(f"[GPS ] edge add failed at k={k}: {e}")
+
+                # --- single map insert, then mark dirty ---
+                with self.map_lock:
+                    self.map.insert(pts_k, T_k)
+                self._mark_dirty()
+
+                # --- scan-context only when needed (keyframe policy) ---
                 if self._needs_keyframe(T_k):
+                    stride = max(1, int(len(pts_k) // 12000))  # light SC input
+                    sc_k = make_scan_context(pts_k[::stride], n_ring=self.sc_n_ring, n_sector=self.sc_n_sector)
                     with self.lock:
                         self._loopdb_add(k, sc_k)
                         self._last_kf_pose = T_k.copy()
 
-                # ---- single map insert (keep this one) ----
-                with self.map_lock:
-                    self.map.insert(pts_k, T_k)
-                self._mark_dirty()  # mark once; remove any duplicate bumps
+                # --- update motion prior for next frame ---
+                self._last_delta = T_cur_to_prev.astype(np.float32, copy=True)
 
+                # --- bookkeeping & periodic perf log ---
                 with self.lock:
-                    # (keep only bookkeeping here; removed the duplicate _map_dirty / map_version)
                     self.last_processed_idx = k
                     self.progress = k / max(1, self.n - 1)
                     blk = k // 500
-                    if blk != self._last_log_block and k % 500 == 0:
+                    if blk != self._last_log_block and (k % 500) == 0:
                         now = time.perf_counter()
                         dt = now - self._t0
                         self._t0 = now
@@ -740,14 +926,16 @@ class PipelineSLAM:
 
                 prev_pts = pts_k
 
-                try: self.q_odo.put((k, pts_k[::4], T_k.astype(np.float32), False), timeout=0.5)
-                except queue.Full: pass
+                # hand a light copy to the loop/global thread
+                try:
+                    self.q_odo.put((k, pts_k[::4], T_k.astype(np.float32), False), timeout=0.5)
+                except queue.Full:
+                    pass
 
         except Exception as e:
             import traceback
             print("[ODO ] fatal:", repr(e), flush=True)
             traceback.print_exc()
-
 
     def _worker_loop_global(self):
         log("[LOOP] start", flush=True)
@@ -979,8 +1167,10 @@ def rotz(theta: float) -> np.ndarray:
     return T
 
 # --------- App ---------
-def build_app(seq_dir: str, fps: int = 10):
+def build_app(seq_dir: str, gps_dir: str, fps: int = 10):
     files = list_kitti_bins(seq_dir)
+
+    gps = load_kitti_oxts(gps_dir)
 
     @lru_cache(maxsize=256)
     def load_frame(i: int) -> np.ndarray:
@@ -1213,6 +1403,9 @@ def build_app(seq_dir: str, fps: int = 10):
             window_horizon=int(state.window_horizon),
             kf_dist_m=float(state.kf_dist_m),
             kf_yaw_deg=float(state.kf_yaw_deg),
+            gps_prior=gps,             # <— pass whole dict
+            gps_edge_every=10,         # add a weak GPS edge every 10 frames
+            use_gps_init=True,         # use GPS rel motion as ICP init
         )
         s.min_d = float(state.min_d); s.max_d = float(state.max_d)
         s.ds_voxel = float(state.ds_voxel); s.loop_on = bool(state.loop_on)
@@ -1934,9 +2127,10 @@ def build_app(seq_dir: str, fps: int = 10):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq_dir", default=r"D:\Work\Lidar_Map_Trame\dataset\2011_10_03\2011_10_03_drive_0027_sync\velodyne_points\data")
+    ap.add_argument("--gps_dir", default=r"D:\Work\Lidar_Map_Trame\dataset\2011_10_03\2011_10_03_drive_0027_sync\oxts\data")
     ap.add_argument("--port", type=int, default=1234)
     ap.add_argument("--fps", type=int, default=10)
     args = ap.parse_args()
 
-    server = build_app(args.seq_dir, fps=args.fps)
+    server = build_app(args.seq_dir, args.gps_dir, fps=args.fps)
     server.start(port=args.port)
