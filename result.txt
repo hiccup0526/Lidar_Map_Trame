@@ -95,3 +95,15 @@ CPU - 6
 [PIPE] 3500 frames processed (+500) in 86.71s  | avg 5.77 FPS
 [PIPE] 4000 frames processed (+500) in 82.07s  | avg 6.09 FPS
 [PIPE] 4500 frames processed (+500) in 86.31s  | avg 5.79 FPS
+
+CPU
+[PIPE] 500 frames processed (+500) in 63.33s  | avg 7.90 FPS
+[PIPE] 1000 frames processed (+500) in 65.64s  | avg 7.62 FPS
+[PIPE] 1500 frames processed (+500) in 65.90s  | avg 7.59 FPS
+[PIPE] 2000 frames processed (+500) in 65.56s  | avg 7.63 FPS
+[PIPE] 2500 frames processed (+500) in 69.79s  | avg 7.16 FPS
+[PIPE] 3000 frames processed (+500) in 65.22s  | avg 7.67 FPS
+[PIPE] 3500 frames processed (+500) in 65.61s  | avg 7.62 FPS
+[PIPE] 4000 frames processed (+500) in 65.86s  | avg 7.59 FPS
+[PIPE] 4500 frames processed (+500) in 68.25s  | avg 7.33 FPS
+
