@@ -2,3 +2,6 @@
 dataset
 build
 dist
+result.txt
+temp.py
+.vscode
